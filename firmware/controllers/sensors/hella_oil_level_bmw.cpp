@@ -145,7 +145,6 @@ void initHellaOilLevelSensor(bool isFirstTime) {
 }
 
 
-
 void deInitHellaOilLevelSensor() {
     levelSensor.unregister();
     tempSensor.unregister();
