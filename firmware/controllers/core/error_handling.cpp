@@ -13,7 +13,7 @@
 #include "log_hard_fault.h"
 #include "rusefi/critical_error.h"
 #include "rusefi/efistring.h"
-
+char *strlncpy(char *dest, const char *src, size_t size);
 #if EFI_USE_OPENBLT
 /* communication with OpenBLT that is plain C, not to modify external file */
 extern "C" {
