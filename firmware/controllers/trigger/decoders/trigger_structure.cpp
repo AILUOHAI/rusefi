@@ -653,12 +653,10 @@ void TriggerWaveform::initializeTriggerWaveform(operation_mode_e triggerOperatio
 		break;
 
 	case trigger_type_e::TT_TOOTHED_WHEEL_60_2:
-    initializeSkippedToothTrigger(this, 60, 2, triggerOperationMode, SyncEdge::RiseOnly);
-    // Gap ratio measured from real sensor data: 3.5–5.0x at stable RPM,
-    // lower boundary 3.2 to handle cranking/acceleration transitions
+    initializeSkippedToothTrigger(this, 60, 2, triggerOperationMode, SyncEdge::Rise);
+    
     setTriggerSynchronizationGap3(/*gapIndex*/0, /*from*/3.5, /*to*/5.0);
-    // Second gap (tooth immediately after gap) should be ~1.0-1.8x normal tooth
-    setTriggerSynchronizationGap3(/*gapIndex*/1, /*from*/0.5, /*to*/2.0); // noise rejection on cranking
+    setTriggerSynchronizationGap3(/*gapIndex*/1, /*from*/0.5, /*to*/2.0);
     break;
 
 	case trigger_type_e::TT_TOOTHED_WHEEL_36_2:
