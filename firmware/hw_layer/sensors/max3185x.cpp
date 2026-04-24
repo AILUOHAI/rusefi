@@ -61,40 +61,37 @@ public:
 	} Max3185xState;
 
 	int start(spi_device_e device, egt_cs_array_t cs) {
-	driver = getSpiDevice(device);
+		driver = getSpiDevice(device);
 
-	if (driver) {
-		/* WARN: this will clear all other bits in cr1 */
-		//spiConfig.cr1 = getSpiPrescaler(_5MHz, device);
+		if (driver) {
+			/* WARN: this will clear all other bits in cr1 */
+			//spiConfig.cr1 = getSpiPrescaler(_5MHz, device);
+			for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
+				auto& sensor = egtSensors[i];
 
-		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-			auto& sensor = egtSensors[i];
+				m_cs[i] = Gpio::Invalid;
+				types[i] = UNKNOWN_TYPE;
 
-			m_cs[i] = Gpio::Invalid;
-			types[i] = UNKNOWN_TYPE;
+				// If there's already another (CAN?) EGT sensor configured,
+				// don't configure this one.
+				if (Sensor::hasSensor(sensor.type()))
+					continue;
 
-			// If there's already another (CAN?) EGT sensor configured,
-			// don't configure this one.
-			if (Sensor::hasSensor(sensor.type()))
-				continue;
+				// get CS pin and mark used!
+				if (isBrainPinValid(cs[i])) {
+					initSpiCs(&spiConfig, cs[i]);
+					m_cs[i] = cs[i];
 
-			// get CS pin and mark used!
-			if (isBrainPinValid(cs[i])) {
-				initSpiCs(&spiConfig, cs[i]);
-				m_cs[i] = cs[i];
-				types[i] = MAX31855_TYPE;
-
-				sensor.Register();
+					sensor.Register();
+				}
 			}
+			ThreadController::start();
+			return 0;
 		}
 
-		ThreadController::start();
-		return 0;
+		efiPrintf("EGT not configured");
+		return -1;
 	}
-
-	efiPrintf("EGT not configured");
-	return -1;
-}
 
 	void stop(void) {
 		ThreadController::stop();
@@ -202,7 +199,7 @@ private:
 			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |	/* div = 64 */
 			SPI_CR1_MSTR |
 			/* SPI_CR1_CPOL | */ /* // = 0 */
-			 SPI_CR1_CPHA |   // = 1 
+			/* SPI_CR1_CPHA |   // = 1    */
 			0,
 		.cr2 = SPI_CR2_8BIT_MODE
 	};
@@ -500,16 +497,32 @@ private:
 		Max3185xState ret;
 
 		if ((!isBrainPinValid(m_cs[channel])) || (!driver)) {
-		return MAX3185X_NOT_ENABLED;
-	}
+			return MAX3185X_NOT_ENABLED;
+		}
 
-	if (types[channel] == UNKNOWN_TYPE) {
-		types[channel] = MAX31855_TYPE;
-	}
+		/* if chip type is not detected yet try to detect */
+		if (types[channel] == UNKNOWN_TYPE) {
+			types[channel] = detect(channel);
+		}
 
-	ret = getMax31855EgtValues(channel, temp, coldJunctionTemp);
+		/* failed? bail out */
+		if (types[channel] == UNKNOWN_TYPE) {
+			return MAX3185X_NO_REPLY;
+		}
 
-	return ret;
+		if (types[channel] == MAX31855_TYPE) {
+			ret = getMax31855EgtValues(channel, temp, coldJunctionTemp);
+		} else if (types[channel] == MAX31856_TYPE) {
+			ret = getMax31856EgtValues(channel, temp, coldJunctionTemp);
+		} else if (types[channel] == MAX6675_TYPE) {
+			ret = getMax6675EgtValues(channel, temp, coldJunctionTemp);
+		}
+
+		if (ret == MAX3185X_NO_REPLY) {
+			types[channel] = UNKNOWN_TYPE;
+		}
+
+		return ret;
 	}
 
 	Max3185xType types[EGT_CHANNEL_COUNT];
