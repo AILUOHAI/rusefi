@@ -61,37 +61,40 @@ public:
 	} Max3185xState;
 
 	int start(spi_device_e device, egt_cs_array_t cs) {
-		driver = getSpiDevice(device);
+	driver = getSpiDevice(device);
 
-		if (driver) {
-			/* WARN: this will clear all other bits in cr1 */
-			//spiConfig.cr1 = getSpiPrescaler(_5MHz, device);
-			for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-				auto& sensor = egtSensors[i];
+	if (driver) {
+		/* WARN: this will clear all other bits in cr1 */
+		//spiConfig.cr1 = getSpiPrescaler(_5MHz, device);
 
-				m_cs[i] = Gpio::Invalid;
-				types[i] = UNKNOWN_TYPE;
+		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
+			auto& sensor = egtSensors[i];
 
-				// If there's already another (CAN?) EGT sensor configured,
-				// don't configure this one.
-				if (Sensor::hasSensor(sensor.type()))
-					continue;
+			m_cs[i] = Gpio::Invalid;
+			types[i] = UNKNOWN_TYPE;
 
-				// get CS pin and mark used!
-				if (isBrainPinValid(cs[i])) {
-					initSpiCs(&spiConfig, cs[i]);
-					m_cs[i] = cs[i];
+			// If there's already another (CAN?) EGT sensor configured,
+			// don't configure this one.
+			if (Sensor::hasSensor(sensor.type()))
+				continue;
 
-					sensor.Register();
-				}
+			// get CS pin and mark used!
+			if (isBrainPinValid(cs[i])) {
+				initSpiCs(&spiConfig, cs[i]);
+				m_cs[i] = cs[i];
+				types[i] = MAX31855_TYPE;
+
+				sensor.Register();
 			}
-			ThreadController::start();
-			return 0;
 		}
 
-		efiPrintf("EGT not configured");
-		return -1;
+		ThreadController::start();
+		return 0;
 	}
+
+	efiPrintf("EGT not configured");
+	return -1;
+}
 
 	void stop(void) {
 		ThreadController::stop();
@@ -497,32 +500,16 @@ private:
 		Max3185xState ret;
 
 		if ((!isBrainPinValid(m_cs[channel])) || (!driver)) {
-			return MAX3185X_NOT_ENABLED;
-		}
+		return MAX3185X_NOT_ENABLED;
+	}
 
-		/* if chip type is not detected yet try to detect */
-		if (types[channel] == UNKNOWN_TYPE) {
-			types[channel] = detect(channel);
-		}
+	if (types[channel] == UNKNOWN_TYPE) {
+		types[channel] = MAX31855_TYPE;
+	}
 
-		/* failed? bail out */
-		if (types[channel] == UNKNOWN_TYPE) {
-			return MAX3185X_NO_REPLY;
-		}
+	ret = getMax31855EgtValues(channel, temp, coldJunctionTemp);
 
-		if (types[channel] == MAX31855_TYPE) {
-			ret = getMax31855EgtValues(channel, temp, coldJunctionTemp);
-		} else if (types[channel] == MAX31856_TYPE) {
-			ret = getMax31856EgtValues(channel, temp, coldJunctionTemp);
-		} else if (types[channel] == MAX6675_TYPE) {
-			ret = getMax6675EgtValues(channel, temp, coldJunctionTemp);
-		}
-
-		if (ret == MAX3185X_NO_REPLY) {
-			types[channel] = UNKNOWN_TYPE;
-		}
-
-		return ret;
+	return ret;
 	}
 
 	Max3185xType types[EGT_CHANNEL_COUNT];
