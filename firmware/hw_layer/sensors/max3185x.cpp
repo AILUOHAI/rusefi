@@ -248,7 +248,6 @@ private:
 		/* Acquire ownership of the bus. */
 		spiAcquireBus(driver);
 		/* Setup transfer parameters. */
-    spiStop(driver);
     
 		spiStart(driver, &spiConfig);
 		/* Slave Select assertion. */
@@ -513,7 +512,7 @@ private:
 		}
 
 		if (ret == MAX3185X_NO_REPLY) {
-			types[channel] = UNKNOWN_TYPE;
+			types[channel] = detect(channel);
 		}
 
 		return ret;
