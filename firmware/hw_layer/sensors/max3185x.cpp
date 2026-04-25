@@ -4,14 +4,12 @@
  */
 
 #include "pch.h"
-#include "max3185x.h"
-#include "hardware.h"
 
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
-#if EFI_PROD_CODE
-#include "mpu_util.h"
-#endif
+
+#include "max3185x.h"
+#include "hardware.h"
 
 #if EFI_MAX_31855
 
@@ -45,7 +43,7 @@ public:
 		}
 
 		if (!driver) {
-			efiPrintf("MAX31855: no SPI driver for device %d", device);
+			efiPrintf("MAX31855: no SPI driver for device %d", (int)device);
 			return -1;
 		}
 
@@ -85,6 +83,7 @@ public:
 			for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 				float value = 0;
 				Max31855State ret = readChannel(i, &value, nullptr, false);
+
 				if (ret == MAX31855_OK) {
 					egtSensors[i].setValidValue(value, getTimeNowNt());
 				}
@@ -97,17 +96,15 @@ public:
 	}
 
 	void showEgtInfo() {
-#if EFI_PROD_CODE
 		printSpiState();
 		efiPrintf("EGT driver: %s", driver ? "OK" : "NULL");
-		efiPrintf("EGT spi: %d", engineConfiguration->max31855spiDevice);
+		efiPrintf("EGT spi: %d", (int)engineConfiguration->max31855spiDevice);
 
 		for (int i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			if (isBrainPinValid(m_cs[i])) {
 				efiPrintf("EGT CS %d @%s", i + 1, hwPortname(m_cs[i]));
 			}
 		}
-#endif
 	}
 
 	void egtRead() {
@@ -125,7 +122,7 @@ public:
 
 			efiPrintf("egt%d: type max31855, code=%d (%s)",
 				(int)i + 1,
-				code,
+				(int)code,
 				getErrorName(code));
 
 			if (code == MAX31855_OK) {
@@ -135,8 +132,6 @@ public:
 	}
 
 private:
-	static constexpr uint32_t MAX31855_RESERVED_BITS = 0x00020008;
-
 	brain_pin_e m_cs[EGT_CHANNEL_COUNT];
 	SPIDriver* driver = nullptr;
 
@@ -193,13 +188,20 @@ private:
 		return 0;
 	}
 
-	int spiRx32(size_t channel, uint32_t* data) {
+	int spiRx32(size_t channel, uint32_t* data, uint8_t* rawBytes) {
 		uint8_t tx[4] = { 0, 0, 0, 0 };
 		uint8_t rx[4] = { 0, 0, 0, 0 };
 
 		int ret = spiTxRx(channel, tx, rx, 4);
 		if (ret) {
 			return ret;
+		}
+
+		if (rawBytes) {
+			rawBytes[0] = rx[0];
+			rawBytes[1] = rx[1];
+			rawBytes[2] = rx[2];
+			rawBytes[3] = rx[3];
 		}
 
 		if (data) {
@@ -214,11 +216,7 @@ private:
 	}
 
 	Max31855State decodeFault(uint32_t packet) {
-		const bool reservedBad = (packet & MAX31855_RESERVED_BITS) != 0;
-		const bool allZero = packet == 0x00000000;
-		const bool allOne = packet == 0xFFFFFFFF;
-
-		if (reservedBad || allZero || allOne) {
+		if (packet == 0x00000000 || packet == 0xFFFFFFFF) {
 			return MAX31855_NO_REPLY;
 		}
 
@@ -238,16 +236,18 @@ private:
 	}
 
 	float decodeThermocouple(uint32_t packet) {
-		int16_t v = (packet >> 18) & 0x3FFF;
-		v = (int16_t)(v << 2);
-		v = (int16_t)(v >> 2);
+		int16_t v = (int16_t)((packet >> 18) & 0x3FFF);
+		if (v & 0x2000) {
+			v |= 0xC000;
+		}
 		return v * 0.25f;
 	}
 
 	float decodeColdJunction(uint32_t packet) {
-		int16_t v = (packet >> 4) & 0x0FFF;
-		v = (int16_t)(v << 4);
-		v = (int16_t)(v >> 4);
+		int16_t v = (int16_t)((packet >> 4) & 0x0FFF);
+		if (v & 0x0800) {
+			v |= 0xF000;
+		}
 		return v * 0.0625f;
 	}
 
@@ -257,14 +257,20 @@ private:
 		}
 
 		uint32_t packet = 0;
-		int ret = spiRx32(channel, &packet);
+		uint8_t rx[4] = { 0, 0, 0, 0 };
+
+		int ret = spiRx32(channel, &packet, rx);
 
 		if (verbose) {
-			efiPrintf("max31855 ch=%d raw=0x%08" PRIx32 " spiRet=%d cs=%s",
-	(int)channel + 1,
-	packet,
-	ret,
-	hwPortname(m_cs[channel]));
+			efiPrintf("max31855 ch=%d bytes=%02x %02x %02x %02x raw=0x%08" PRIx32 " spiRet=%d cs=%s",
+				(int)channel + 1,
+				(unsigned int)rx[0],
+				(unsigned int)rx[1],
+				(unsigned int)rx[2],
+				(unsigned int)rx[3],
+				packet,
+				ret,
+				hwPortname(m_cs[channel]));
 		}
 
 		if (ret != 0) {
@@ -343,4 +349,4 @@ void startMax3185x(spi_device_e device, egt_cs_array_t max31855_cs) {
 	instance.start(device, max31855_cs);
 }
 
-#endif /* EFI_MAX_31855 */
+#endif // EFI_MAX_31855
