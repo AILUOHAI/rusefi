@@ -62,7 +62,7 @@ public:
 		}
 
       
-spiStart(driver, &spiConfig);
+
         		ThreadController::start();
 		return 0;
 	}	void stop() {
@@ -178,13 +178,13 @@ private:
 
 		initSpiCsNoOccupy(&spiConfig, cs);
 
-		spiAcquireBus(driver);
+		spiStart(driver, &spiConfig);
 	
 		spiSelect(driver);
 		spiExchange(driver, n, tx, rx);
 		spiUnselect(driver);
           
-		spiReleaseBus(driver);
+		// spiReleaseBus removed - using spiStart per transaction
 
 		return 0;
 	}
@@ -302,6 +302,7 @@ private:
 
 		if (coldJunctionTemp) {
 			*coldJunctionTemp = cj;
+  
 		}
 
 		if (verbose) {
