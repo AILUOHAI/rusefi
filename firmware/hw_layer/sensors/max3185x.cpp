@@ -61,12 +61,14 @@ public:
 			}
 		}
 
+        spiStart(driver, &spiConfig);
 		ThreadController::start();
 		return 0;
 	}
 
 	void stop() {
-		ThreadController::stop();
+		        spiStop(driver);
+ThreadController::stop();
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			if (!isBrainPinValid(m_cs[i])) {
@@ -178,11 +180,10 @@ private:
 		initSpiCsNoOccupy(&spiConfig, cs);
 
 		spiAcquireBus(driver);
-		spiStart(driver, &spiConfig);
+	
 		spiSelect(driver);
 		spiExchange(driver, n, tx, rx);
 		spiUnselect(driver);
-		spiStop(driver);
 		spiReleaseBus(driver);
 
 		return 0;
