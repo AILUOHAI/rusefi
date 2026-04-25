@@ -248,6 +248,8 @@ private:
 		/* Acquire ownership of the bus. */
 		spiAcquireBus(driver);
 		/* Setup transfer parameters. */
+    spiStop(driver);
+    
 		spiStart(driver, &spiConfig);
 		/* Slave Select assertion. */
 		spiSelect(driver);
