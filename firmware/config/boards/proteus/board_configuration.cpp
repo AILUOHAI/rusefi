@@ -139,6 +139,7 @@ static void setupSdCard() {
 }
 
 static void proteus_boardConfigOverrides() {
+   setupVbatt();
 	setupSdCard();
     
 
