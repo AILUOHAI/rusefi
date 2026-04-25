@@ -496,7 +496,7 @@ private:
 	}
 
 	Max3185xState getMax3185xEgtValues(size_t channel, float *temp, float *coldJunctionTemp) {
-		Max3185xState ret;
+		Max3185xState ret = MAX3185X_NO_REPLY;
 
 		if ((!isBrainPinValid(m_cs[channel])) || (!driver)) {
 			return MAX3185X_NOT_ENABLED;
