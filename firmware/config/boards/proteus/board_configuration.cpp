@@ -133,11 +133,14 @@ static void setupSdCard() {
 	engineConfiguration->spi5sckPin = Gpio::F7;
 	engineConfiguration->spi5misoPin = Gpio::F8;
 	engineConfiguration->spi5mosiPin = Gpio::F9;
+    engineConfiguration->spi5SckMode = PO_DEFAULT;
+    engineConfiguration->spi5MosiMode = PO_DEFAULT;
+    engineConfiguration->spi5MisoMode = PO_DEFAULT; /* mandatory for SPI5 to work */
 }
 
 static void proteus_boardConfigOverrides() {
 	setupSdCard();
-	setupVbatt();
+    
 
 	engineConfiguration->clt.config.bias_resistor = PROTEUS_DEFAULT_AT_PULLUP;
 	engineConfiguration->iat.config.bias_resistor = PROTEUS_DEFAULT_AT_PULLUP;
