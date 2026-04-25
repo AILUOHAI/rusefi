@@ -392,7 +392,7 @@ private:
 			code = getMax31855ErrorCode(packet);
 		}
 
-       (code != MAX3185X_OK) {
+       if (code != MAX3185X_OK) {
 			return code;
 		}
 
@@ -478,7 +478,7 @@ private:
 			code = getMax6675ErrorCode(packet);
 		}
 
-		if (code != MAX3185X_OK) {
+		if if (code != MAX3185X_OK) {
 			return code;
 		}
 
