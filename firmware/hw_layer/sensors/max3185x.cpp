@@ -61,12 +61,11 @@ public:
 			}
 		}
 
-        spiStart(driver, &spiConfig);
-		ThreadController::start();
+      
+spiStart(driver, &spiConfig);
+        		ThreadController::start();
 		return 0;
-	}
-
-	void stop() {
+	}	void stop() {
 		        if (driver) spiStop(driver);
 ThreadController::stop();
 
@@ -184,6 +183,7 @@ private:
 		spiSelect(driver);
 		spiExchange(driver, n, tx, rx);
 		spiUnselect(driver);
+          
 		spiReleaseBus(driver);
 
 		return 0;
