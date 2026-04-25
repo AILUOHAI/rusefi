@@ -16,84 +16,79 @@
  *
  */
 
+/**
+ * @file max3185x.cpp
+ * @brief MAX31855 only thermocouple driver with raw SPI debug
+ */
+
+/**
+ * @file max3185x.cpp
+ * @brief MAX31855 only thermocouple driver with raw SPI debug
+ */
+
 #include "pch.h"
 #include "max3185x.h"
-
 #include "hardware.h"
 
 #if EFI_PROD_CODE
 #include "mpu_util.h"
-#endif /* EFI_PROD_CODE */
+#endif
 
 #if EFI_MAX_31855
 
 #include "thread_controller.h"
 #include "stored_value_sensor.h"
 
-#ifndef MAX3185X_REFRESH_TIME
-#define MAX3185X_REFRESH_TIME 100
-// MAX6675 needs 0.22 S for convertion in worst case
-#define MAX6675_REFRESH_TIME 250
+#ifndef MAX31855_REFRESH_TIME
+#define MAX31855_REFRESH_TIME 100
 #endif
 
-/* TODO: move all stuff to Max3185xRead class */
-class Max3185xRead final : public ThreadController<UTILITY_THREAD_STACK_SIZE> {
+class Max31855Read final : public ThreadController<UTILITY_THREAD_STACK_SIZE> {
 public:
-	Max3185xRead()
-		: ThreadController("MAX3185X", MAX31855_PRIO)
-	{
+	Max31855Read()
+		: ThreadController("MAX31855", MAX31855_PRIO) {
 	}
 
-	typedef enum {
-		UNKNOWN_TYPE = 0,
-		MAX31855_TYPE = 1,
-		MAX31856_TYPE = 2,
-		MAX6675_TYPE = 3
-	} Max3185xType;
-
-	typedef enum {
-		MAX3185X_OK = 0,
-		MAX3185X_OPEN_CIRCUIT = 1,
-		MAX3185X_SHORT_TO_GND = 2,
-		MAX3185X_SHORT_TO_VCC = 3,
-		MAX3185X_NO_REPLY = 4,
-		MAX3185X_NOT_ENABLED = 5,
-	} Max3185xState;
+	enum Max31855State {
+		MAX31855_OK = 0,
+		MAX31855_OPEN_CIRCUIT = 1,
+		MAX31855_SHORT_TO_GND = 2,
+		MAX31855_SHORT_TO_VCC = 3,
+		MAX31855_NO_REPLY = 4,
+		MAX31855_NOT_ENABLED = 5,
+	};
 
 	int start(spi_device_e device, egt_cs_array_t cs) {
 		driver = getSpiDevice(device);
 
-		if (driver) {
-			/* WARN: this will clear all other bits in cr1 */
-			//spiConfig.cr1 = getSpiPrescaler(_5MHz, device);
-			for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-				auto& sensor = egtSensors[i];
-
-				m_cs[i] = Gpio::Invalid;
-				types[i] = UNKNOWN_TYPE;
-
-				// If there's already another (CAN?) EGT sensor configured,
-				// don't configure this one.
-				if (Sensor::hasSensor(sensor.type()))
-					continue;
-
-				// get CS pin and mark used!
-				if (isBrainPinValid(cs[i])) {
-					initSpiCs(&spiConfig, cs[i]);
-					m_cs[i] = cs[i];
-
-					sensor.Register();
-				}
-			}
-			ThreadController::start();
-			return 0;
+		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
+			m_cs[i] = Gpio::Invalid;
 		}
 
-		efiPrintf("EGT not configured");
-		return -1;
+		if (!driver) {
+			efiPrintf("MAX31855: no SPI driver for device %d", device);
+			return -1;
+		}
+
+		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
+			auto& sensor = egtSensors[i];
+
+			if (Sensor::hasSensor(sensor.type())) {
+				continue;
+			}
+
+			if (isBrainPinValid(cs[i])) {
+				initSpiCs(&spiConfig, cs[i]);
+				m_cs[i] = cs[i];
+				sensor.Register();
+			}
+		}
+
+		ThreadController::start();
+		return 0;
 	}
 
-	void stop(void) {
+	void stop() {
 		ThreadController::stop();
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
@@ -101,45 +96,31 @@ public:
 				continue;
 			}
 
-			auto& sensor = egtSensors[i];
-
 			brain_pin_markUnused(m_cs[i]);
-			sensor.unregister();
+			egtSensors[i].unregister();
 		}
 	}
 
 	void ThreadTask() override {
 		while (!chThdShouldTerminateX()) {
-			sysinterval_t refreshTime = MAX3185X_REFRESH_TIME;
-			for (int i = 0; i < EGT_CHANNEL_COUNT; i++) {
-				float value;
-
-				Max3185xState ret = getMax3185xEgtValues(i, &value, NULL);
-				if (ret == MAX3185X_OK) {
-					auto& sensor = egtSensors[i];
-
-					sensor.setValidValue(value, getTimeNowNt());
-
-					// this one is slow
-					if (types[i] == MAX6675_TYPE) {
-						refreshTime = MAX6675_REFRESH_TIME;
-					}
-				} else {
-					/* TODO: report error code? */
+			for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
+				float value = 0;
+				Max31855State ret = readChannel(i, &value, nullptr, false);
+				if (ret == MAX31855_OK) {
+					egtSensors[i].setValidValue(value, getTimeNowNt());
 				}
 			}
 
-			chThdSleepMilliseconds(refreshTime);
+			chThdSleepMilliseconds(MAX31855_REFRESH_TIME);
 		}
 
 		chThdExit((msg_t)0x0);
 	}
 
-	/* Debug stuff */
 	void showEgtInfo() {
-	#if EFI_PROD_CODE
+#if EFI_PROD_CODE
 		printSpiState();
-
+		efiPrintf("EGT driver: %s", driver ? "OK" : "NULL");
 		efiPrintf("EGT spi: %d", engineConfiguration->max31855spiDevice);
 
 		for (int i = 0; i < EGT_CHANNEL_COUNT; i++) {
@@ -147,399 +128,219 @@ public:
 				efiPrintf("EGT CS %d @%s", i + 1, hwPortname(m_cs[i]));
 			}
 		}
-	#endif
+#endif
 	}
 
 	void egtRead() {
-		if (driver == NULL) {
-			efiPrintf("No SPI selected for EGT");
+		if (driver == nullptr) {
+			efiPrintf("MAX31855: no SPI selected");
 			return;
 		}
 
 		efiPrintf("Reading egt(s)");
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-			float temp, refTemp;
-			Max3185xState code = getMax3185xEgtValues(i, &temp, &refTemp);
+			float temp = 0;
+			float refTemp = 0;
+			Max31855State code = readChannel(i, &temp, &refTemp, true);
 
-			efiPrintf("egt%d: type %s, code=%d (%s)", i + 1, getMax3185xTypeName(types[i]), code, getMax3185xErrorCodeName(code));
+			efiPrintf("egt%d: type max31855, code=%d (%s)",
+				(int)i + 1,
+				code,
+				getErrorName(code));
 
-			if (code == MAX3185X_OK) {
+			if (code == MAX31855_OK) {
 				efiPrintf(" temperature %.4f reference temperature %.2f", temp, refTemp);
 			}
 		}
 	}
 
 private:
-	// bits D17 and D3 are always expected to be zero
-	#define MAX31855_RESERVED_BITS	0x20008
-	// bit D3 is always expected to be zero, D15 is dummy sign bit also always zero
-	#define MAX6675_RESERVED_BITS	0x8002
+	static constexpr uint32_t MAX31855_RESERVED_BITS = 0x00020008;
 
 	brain_pin_e m_cs[EGT_CHANNEL_COUNT];
+	SPIDriver* driver = nullptr;
 
-	SPIDriver *driver;
-
-	/* TODO: validate */
 	SPIConfig spiConfig = {
 		.circular = false,
 #ifdef _CHIBIOS_RT_CONF_VER_6_1_
-		.end_cb = NULL,
+		.end_cb = nullptr,
 #else
 		.slave = false,
-		.data_cb = NULL,
-		.error_cb = NULL,
+		.data_cb = nullptr,
+		.error_cb = nullptr,
 #endif
-		.ssport = NULL,
+		.ssport = nullptr,
 		.sspad = 0,
 		.cr1 =
 			SPI_CR1_8BIT_MODE |
 			SPI_CR1_SSM |
 			SPI_CR1_SSI |
-			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |	/* div = 64 */
+			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |
 			SPI_CR1_MSTR |
-			/* SPI_CR1_CPOL | */ /* // = 0 */
-			/* SPI_CR1_CPHA |   // = 1    */
 			0,
 		.cr2 = SPI_CR2_8BIT_MODE
 	};
 
-	const char * getMax3185xErrorCodeName(Max3185xState code) {
+	const char* getErrorName(Max31855State code) {
 		switch (code) {
-		case MAX3185X_OK:
-			return "Ok";
-		case MAX3185X_OPEN_CIRCUIT:
-			return "Open";
-		case MAX3185X_SHORT_TO_GND:
-			return "short gnd";
-		case MAX3185X_SHORT_TO_VCC:
-			return "short VCC";
-		case MAX3185X_NO_REPLY:
-			return "no reply";
-		case MAX3185X_NOT_ENABLED:
-			return "not enabled";
-		default:
-			return "invalid";
+		case MAX31855_OK: return "Ok";
+		case MAX31855_OPEN_CIRCUIT: return "Open";
+		case MAX31855_SHORT_TO_GND: return "short gnd";
+		case MAX31855_SHORT_TO_VCC: return "short VCC";
+		case MAX31855_NO_REPLY: return "no reply";
+		case MAX31855_NOT_ENABLED: return "not enabled";
+		default: return "invalid";
 		}
 	}
 
-	const char *getMax3185xTypeName(Max3185xType type) {
-		switch (type) {
-		case MAX31855_TYPE:
-			return "max31855";
-		case MAX31856_TYPE:
-			return "max31856";
-		case MAX6675_TYPE:
-			return "max6675";
-		default:
-			return "unknown";
-		}
-	}
-
-	int spi_txrx(size_t channel, uint8_t tx[], uint8_t rx[], size_t n)
-	{
+	int spiTxRx(size_t channel, const uint8_t* tx, uint8_t* rx, size_t n) {
 		brain_pin_e cs = m_cs[channel];
 
-		if ((!isBrainPinValid(cs)) || (driver == NULL)) {
+		if (!isBrainPinValid(cs) || driver == nullptr) {
 			return -1;
 		}
 
-		/* Set proper CS gpio */
 		initSpiCsNoOccupy(&spiConfig, cs);
 
-		/* Acquire ownership of the bus. */
 		spiAcquireBus(driver);
-		/* Setup transfer parameters. */
 		spiStart(driver, &spiConfig);
-		/* Slave Select assertion. */
 		spiSelect(driver);
 		spiExchange(driver, n, tx, rx);
-		/* Slave Select de-assertion. */
 		spiUnselect(driver);
-		/* Ownership release. */
+		spiStop(driver);
 		spiReleaseBus(driver);
 
-		/* no errors for now */
 		return 0;
 	}
 
-	int spi_rx16(size_t channel, uint16_t *data)
-	{
-		int ret;
-		/* dummy */
-		uint8_t tx[2] = {0};
-		uint8_t rx[2];
+	int spiRx32(size_t channel, uint32_t* data) {
+		uint8_t tx[4] = { 0, 0, 0, 0 };
+		uint8_t rx[4] = { 0, 0, 0, 0 };
 
-		ret = spi_txrx(channel, tx, rx, 2);
+		int ret = spiTxRx(channel, tx, rx, 4);
 		if (ret) {
 			return ret;
 		}
+
 		if (data) {
-			*data =	(rx[0] << 8) |
-					(rx[1] << 0);
+			*data =
+				((uint32_t)rx[0] << 24) |
+				((uint32_t)rx[1] << 16) |
+				((uint32_t)rx[2] << 8) |
+				((uint32_t)rx[3] << 0);
 		}
 
 		return 0;
 	}
 
-	int spi_rx32(size_t channel, uint32_t *data)
-	{
-		int ret;
-		/* dummy */
-		uint8_t tx[4] = {0};
-		uint8_t rx[4];
+	Max31855State decodeFault(uint32_t packet) {
+		const bool reservedBad = (packet & MAX31855_RESERVED_BITS) != 0;
+		const bool allZero = packet == 0x00000000;
+		const bool allOne = packet == 0xFFFFFFFF;
 
-		ret = spi_txrx(channel, tx, rx, 4);
-		if (ret) {
-			return ret;
-		}
-		if (data) {
-			*data =	(rx[0] << 24) |
-					(rx[1] << 16) |
-					(rx[2] <<  8) |
-					(rx[3] <<  0);
+		if (reservedBad || allZero || allOne) {
+			return MAX31855_NO_REPLY;
 		}
 
-		return 0;
+		if (packet & BIT(16)) {
+			if (packet & BIT(0)) {
+				return MAX31855_OPEN_CIRCUIT;
+			}
+			if (packet & BIT(1)) {
+				return MAX31855_SHORT_TO_GND;
+			}
+			if (packet & BIT(2)) {
+				return MAX31855_SHORT_TO_VCC;
+			}
+		}
+
+		return MAX31855_OK;
 	}
 
-	Max3185xType detect(size_t channel)
-	{
-		int ret;
-		uint8_t rx[4];
-		uint8_t tx[4];
-
-		/* try to apply settings to max31956 and then read back settings */
-		// Wr, register 0x00
-		tx[0] = 0x00 | BIT(7);
-		// CR0: 50Hz mode
-		// Change the notch frequency only while in the "Normally Off" mode - not in the Automatic
-		tx[1] = 0x01;
-		ret = spi_txrx(channel, tx, rx, 2);
-		if (ret) {
-			return UNKNOWN_TYPE;
-		}
-
-		// CR0: Automatic Conversion mode, OCFAULT = 2, 50Hz mode
-		tx[1] = BIT(7) | BIT(0) | (2 << 4);
-		// CR1: 4 samples average, K type
-		tx[2] = (2 << 4) | (3 << 0);
-		ret = spi_txrx(channel, tx, rx, 3);
-		if (ret) {
-			return UNKNOWN_TYPE;
-		}
-
-		/* Now readback settings */
-		tx[0] = 0x00;
-		ret = spi_txrx(channel, tx, rx, 4);
-		if ((rx[1] == tx[1]) && (rx[2] == tx[2])) {
-			return MAX31856_TYPE;
-		}
-
-		/* in case of max31855 we get standart reply with few reserved, always zero bits */
-		uint32_t data = (rx[0] << 24) |
-						(rx[1] << 16) |
-						(rx[2] <<  8) |
-						(rx[3] <<  0);
-
-		/* MISO is constantly low or high */
-		if ((data == 0xffffffff) || (data == 0x0)) {
-			return UNKNOWN_TYPE;
-		}
-
-		/* MAX6675 replyes with 16 bit. */
-		if ((data >> 16) == (data & 0xffff)) {
-			return MAX6675_TYPE;
-		}
-
-		if ((data & MAX31855_RESERVED_BITS) == 0x0) {
-			return MAX31855_TYPE;
-		}
-
-		return UNKNOWN_TYPE;
+	float decodeThermocouple(uint32_t packet) {
+		int16_t v = (packet >> 18) & 0x3FFF;
+		v = (int16_t)(v << 2);
+		v = (int16_t)(v >> 2);
+		return v * 0.25f;
 	}
 
-	Max3185xState getMax31855ErrorCode(uint32_t egtPacket) {
-		#define MAX33855_FAULT_BIT			BIT(16)
-		#define MAX33855_OPEN_BIT			BIT(0)
-		#define MAX33855_GND_BIT			BIT(1)
-		#define MAX33855_VCC_BIT			BIT(2)
-
-		if (((egtPacket & MAX31855_RESERVED_BITS) != 0) ||
-			(egtPacket == 0x0) ||
-			(egtPacket == 0xffffffff)) {
-			return MAX3185X_NO_REPLY;
-		} else if ((egtPacket & MAX33855_OPEN_BIT) != 0) {
-			return MAX3185X_OPEN_CIRCUIT;
-		} else if ((egtPacket & MAX33855_GND_BIT) != 0) {
-			return MAX3185X_SHORT_TO_GND;
-		} else if ((egtPacket & MAX33855_VCC_BIT) != 0) {
-			return MAX3185X_SHORT_TO_VCC;
-		} else {
-			return MAX3185X_OK;
-		}
+	float decodeColdJunction(uint32_t packet) {
+		int16_t v = (packet >> 4) & 0x0FFF;
+		v = (int16_t)(v << 4);
+		v = (int16_t)(v >> 4);
+		return v * 0.0625f;
 	}
 
-	Max3185xState getMax31855EgtValues(size_t channel, float *temp, float *coldJunctionTemp) {
-		uint32_t packet;
-		Max3185xState code = MAX3185X_NO_REPLY;
-		int ret;
-
-		ret = spi_rx32(channel, &packet);
-		if (ret == 0) {
-			code = getMax31855ErrorCode(packet);
+	Max31855State readChannel(size_t channel, float* temp, float* coldJunctionTemp, bool verbose) {
+		if (!isBrainPinValid(m_cs[channel]) || driver == nullptr) {
+			return MAX31855_NOT_ENABLED;
 		}
 
-		if (code != MAX3185X_OK) {
+		uint32_t packet = 0;
+		int ret = spiRx32(channel, &packet);
+
+		if (verbose) {
+			efiPrintf("max31855 ch=%d raw=0x%08x spiRet=%d cs=%s",
+				(int)channel + 1,
+				packet,
+				ret,
+				hwPortname(m_cs[channel]));
+		}
+
+		if (ret != 0) {
+			return MAX31855_NO_REPLY;
+		}
+
+		Max31855State code = decodeFault(packet);
+
+		if (verbose) {
+			efiPrintf("max31855 ch=%d fault=%d oc=%d scg=%d scv=%d",
+				(int)channel + 1,
+				(packet & BIT(16)) ? 1 : 0,
+				(packet & BIT(0)) ? 1 : 0,
+				(packet & BIT(1)) ? 1 : 0,
+				(packet & BIT(2)) ? 1 : 0);
+		}
+
+		if (code != MAX31855_OK) {
 			return code;
 		}
 
-		if (temp) {
-			// bits 31:18, 0.25C resolution (1/4 C)
-			int16_t tmp = (packet >> 18) & 0x3fff;
-			/* extend sign */
-			tmp = tmp << 2;
-			tmp = tmp >> 2;	/* shifting right signed is not a good idea */
-			*temp = (float) tmp * 0.25;
-		}
-		if (coldJunctionTemp) {
-			// bits 15:4, 0.0625C resolution (1/16 C)
-			int16_t tmp = (packet >> 4) & 0xfff;
-			/* extend sign */
-			tmp = tmp << 4;
-			tmp = tmp >> 4;	/* shifting right signed is not a good idea */
-			*coldJunctionTemp = (float)tmp * 0.0625;
-		}
-
-		return code;
-	}
-
-	Max3185xState getMax6675ErrorCode(uint16_t egtPacket) {
-		#define MAX6675_OPEN_BIT			BIT(2)
-
-		if (((egtPacket & MAX6675_RESERVED_BITS) != 0) ||
-			(egtPacket == 0x0) ||
-			(egtPacket == 0xffff)) {
-			return MAX3185X_NO_REPLY;
-		} else if ((egtPacket & MAX6675_OPEN_BIT) != 0) {
-			return MAX3185X_OPEN_CIRCUIT;
-		} else {
-			return MAX3185X_OK;
-		}
-	}
-
-	Max3185xState getMax31856EgtValues(size_t channel, float *temp, float *coldJunctionTemp)
-	{
-		uint8_t rx[7];
-		/* read Cold-Junction temperature MSB, LSB, Linearized TC temperature 3 bytes and Fault Status */
-		uint8_t tx[7] = {0x0a};
-
-		int ret = spi_txrx(channel, tx, rx, 7);
-		if (ret) {
-			return MAX3185X_NO_REPLY;
-		}
-
-		if (rx[6] & BIT(0)) {
-			return MAX3185X_OPEN_CIRCUIT;
-		} else if (rx[6] & BIT(1)) {
-			return MAX3185X_SHORT_TO_VCC;
-		}
+		float tc = decodeThermocouple(packet);
+		float cj = decodeColdJunction(packet);
 
 		if (temp) {
-			// 10 bit before point and 7 bits after
-			int32_t tmp = (rx[3] << 11) | (rx[4] << 3) | (rx[5] >> 5);
-			/* extend sign: move top bit 18 to 31 */
-			tmp = tmp << 13;
-			tmp = tmp >> 13;	/* shifting right signed is not a good idea */
-			*temp = ((float)tmp) / 128.0;
+			*temp = tc;
 		}
 
-		/* convert float to int */
 		if (coldJunctionTemp) {
-			int16_t tmp = (rx[1] << 6) | (rx[2] >> 2);
-			/* extend sign */
-			tmp = tmp << 2;
-			tmp = tmp >> 2;	/* shifting right signed is not a good idea */
-			*coldJunctionTemp = ((float)tmp) / 64.0;
+			*coldJunctionTemp = cj;
 		}
 
-		return MAX3185X_OK;
+		if (verbose) {
+			efiPrintf("max31855 ch=%d tc=%.2f cj=%.2f",
+				(int)channel + 1,
+				tc,
+				cj);
+		}
+
+		return MAX31855_OK;
 	}
-
-	Max3185xState getMax6675EgtValues(size_t channel, float *temp, float *coldJunctionTemp) {
-		uint16_t packet;
-		Max3185xState code = MAX3185X_NO_REPLY;
-		int ret;
-
-		ret = spi_rx16(channel, &packet);
-		if (ret == 0) {
-			code = getMax6675ErrorCode(packet);
-		}
-
-		if (code != MAX3185X_OK) {
-			return code;
-		}
-
-		if (temp) {
-			// bits 14:3, 0.25C resolution
-			uint16_t tmp = (packet >> 3) & 0x0fff;
-			*temp = (float) tmp * 0.25;
-		}
-		if (coldJunctionTemp) {
-			// this chip does not provide
-			*coldJunctionTemp = -273.15;
-		}
-
-		return code;
-	}
-
-	Max3185xState getMax3185xEgtValues(size_t channel, float *temp, float *coldJunctionTemp) {
-		Max3185xState ret;
-
-		if ((!isBrainPinValid(m_cs[channel])) || (!driver)) {
-			return MAX3185X_NOT_ENABLED;
-		}
-
-		/* if chip type is not detected yet try to detect */
-		if (types[channel] == UNKNOWN_TYPE) {
-			types[channel] = detect(channel);
-		}
-
-		/* failed? bail out */
-		if (types[channel] == UNKNOWN_TYPE) {
-			return MAX3185X_NO_REPLY;
-		}
-
-		if (types[channel] == MAX31855_TYPE) {
-			ret = getMax31855EgtValues(channel, temp, coldJunctionTemp);
-		} else if (types[channel] == MAX31856_TYPE) {
-			ret = getMax31856EgtValues(channel, temp, coldJunctionTemp);
-		} else if (types[channel] == MAX6675_TYPE) {
-			ret = getMax6675EgtValues(channel, temp, coldJunctionTemp);
-		}
-
-		if (ret == MAX3185X_NO_REPLY) {
-			types[channel] = UNKNOWN_TYPE;
-		}
-
-		return ret;
-	}
-
-	Max3185xType types[EGT_CHANNEL_COUNT];
 
 	StoredValueSensor egtSensors[EGT_CHANNEL_COUNT] = {
-		{ SensorType::EGT1, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT2, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT3, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT4, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT5, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT6, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT7, MS2NT(MAX6675_REFRESH_TIME * 3) },
-		{ SensorType::EGT8, MS2NT(MAX6675_REFRESH_TIME * 3) }
+		{ SensorType::EGT1, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT2, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT3, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT4, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT5, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT6, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT7, MS2NT(MAX31855_REFRESH_TIME * 3) },
+		{ SensorType::EGT8, MS2NT(MAX31855_REFRESH_TIME * 3) },
 	};
 };
 
-static Max3185xRead instance;
+static Max31855Read instance;
 
 static void showEgtInfo() {
 	instance.showEgtInfo();
@@ -550,9 +351,8 @@ static void egtRead() {
 }
 
 void initMax3185x(spi_device_e device, egt_cs_array_t max31855_cs) {
-	addConsoleAction("egtinfo", (Void) showEgtInfo);
-	addConsoleAction("egtread", (Void) egtRead);
-
+	addConsoleAction("egtinfo", (Void)showEgtInfo);
+	addConsoleAction("egtread", (Void)egtRead);
 	startMax3185x(device, max31855_cs);
 }
 
@@ -560,8 +360,7 @@ void stopMax3185x() {
 	instance.stop();
 }
 
-void startMax3185x(spi_device_e device, egt_cs_array_t max31855_cs)
-{
+void startMax3185x(spi_device_e device, egt_cs_array_t max31855_cs) {
 	instance.start(device, max31855_cs);
 }
 
