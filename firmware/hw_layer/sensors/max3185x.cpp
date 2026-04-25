@@ -70,7 +70,7 @@ public:
 				auto& sensor = egtSensors[i];
 
 				m_cs[i] = Gpio::Invalid;
-				types[i] = UNKNOWN_TYPE;
+				types[i] = MAX31855_TYPE;
 
 				// If there's already another (CAN?) EGT sensor configured,
 				// don't configure this one.
@@ -500,15 +500,7 @@ private:
 			return MAX3185X_NOT_ENABLED;
 		}
 
-		/* if chip type is not detected yet try to detect */
-		if (types[channel] == UNKNOWN_TYPE) {
-			types[channel] = detect(channel);
-		}
-
-		/* failed? bail out */
-		if (types[channel] == UNKNOWN_TYPE) {
-			return MAX3185X_NO_REPLY;
-		}
+		
 
 		if (types[channel] == MAX31855_TYPE) {
 			ret = getMax31855EgtValues(channel, temp, coldJunctionTemp);
