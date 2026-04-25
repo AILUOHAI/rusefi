@@ -7,6 +7,8 @@
 #include "max3185x.h"
 #include "hardware.h"
 
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 #if EFI_PROD_CODE
 #include "mpu_util.h"
 #endif
@@ -258,11 +260,11 @@ private:
 		int ret = spiRx32(channel, &packet);
 
 		if (verbose) {
-			efiPrintf("max31855 ch=%d raw=0x%08x spiRet=%d cs=%s",
-				(int)channel + 1,
-				packet,
-				ret,
-				hwPortname(m_cs[channel]));
+			efiPrintf("max31855 ch=%d raw=0x%08" PRIx32 " spiRet=%d cs=%s",
+	(int)channel + 1,
+	packet,
+	ret,
+	hwPortname(m_cs[channel]));
 		}
 
 		if (ret != 0) {
