@@ -67,7 +67,7 @@ public:
 	}
 
 	void stop() {
-		        spiStop(driver);
+		        if (driver) spiStop(driver);
 ThreadController::stop();
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
