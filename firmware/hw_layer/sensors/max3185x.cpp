@@ -199,7 +199,7 @@ private:
 			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |	/* div = 64 */
 			SPI_CR1_MSTR |
 			/* SPI_CR1_CPOL | */ // = 0
-			/* SPI_CR1_CPHA | */ // = 1
+			 SPI_CR1_CPHA |  // = 1
 			0,
 		.cr2 = SPI_CR2_8BIT_MODE
 	};
@@ -256,6 +256,8 @@ private:
 		spiExchange(driver, n, tx, rx);
 		/* Slave Select de-assertion. */
 		spiUnselect(driver);
+
+    spiStop(driver); 
 		/* Ownership release. */
 		spiReleaseBus(driver);
 
