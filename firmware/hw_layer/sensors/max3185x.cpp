@@ -140,6 +140,7 @@ public:
 	#if EFI_PROD_CODE
 		printSpiState();
 
+      efiPrintf("EGT driver: %s", driver ? "OK" : "NULL");
 		efiPrintf("EGT spi: %d", engineConfiguration->max31855spiDevice);
 
 		for (int i = 0; i < EGT_CHANNEL_COUNT; i++) {
@@ -391,7 +392,7 @@ private:
 			code = getMax31855ErrorCode(packet);
 		}
 
-		if (code != MAX3185X_OK) {
+       (code != MAX3185X_OK) {
 			return code;
 		}
 
