@@ -64,7 +64,7 @@ public:
 		NotEnabled  = 5,
 	};
 
-	int start(spi_device_e device, egt_cs_array_t cs) {
+	int init(spi_device_e device, egt_cs_array_t cs) {
 		driver = getSpiDevice(device);
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
@@ -136,7 +136,7 @@ public:
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			if (isBrainPinValid(m_cs[i])) {
-				efiPrintf("EGT CS %zu @%s", i + 1, hwPortname(m_cs[i]));
+				efiPrintf("EGT CS %d @%s", (int)(i + 1), hwPortname(m_cs[i]));
 			}
 		}
 	}
@@ -154,8 +154,8 @@ public:
 			float refTemp = 0.0f;
 			State code = readChannel(i, &temp, &refTemp, /*verbose=*/true);
 
-			efiPrintf("egt%zu: type max31855, code=%d (%s)",
-				i + 1, (int)code, stateName(code));
+			efiPrintf("egt%d: type max31855, code=%d (%s)",
+				(int)(i + 1), (int)code, stateName(code));
 
 			if (code == State::Ok) {
 				efiPrintf(" temperature %.4f reference temperature %.2f", temp, refTemp);
@@ -311,15 +311,17 @@ private:
 
 		// Decompose raw into bytes for the verbose log
 		if (verbose) {
-			efiPrintf("max31855 ch=%zu bytes=%02x %02x %02x %02x raw=0x%08" PRIx32 " cs=%s",
-				ch + 1,
-				(raw >> 24) & 0xFF, (raw >> 16) & 0xFF,
-				(raw >>  8) & 0xFF, (raw >>  0) & 0xFF,
+			efiPrintf("max31855 ch=%d bytes=%02x %02x %02x %02x raw=0x%08" PRIx32 " cs=%s",
+				(int)(ch + 1),
+				(unsigned int)((raw >> 24) & 0xFF),
+				(unsigned int)((raw >> 16) & 0xFF),
+				(unsigned int)((raw >>  8) & 0xFF),
+				(unsigned int)((raw >>  0) & 0xFF),
 				raw,
 				hwPortname(m_cs[ch]));
 
-			efiPrintf("max31855 ch=%zu fault=%d oc=%d scg=%d scv=%d",
-				ch + 1,
+			efiPrintf("max31855 ch=%d fault=%d oc=%d scg=%d scv=%d",
+				(int)(ch + 1),
 				(raw & BIT(16)) ? 1 : 0,
 				(raw & BIT(0))  ? 1 : 0,
 				(raw & BIT(1))  ? 1 : 0,
@@ -351,7 +353,7 @@ private:
 		if (cjTemp) *cjTemp = cj;
 
 		if (verbose) {
-			efiPrintf("max31855 ch=%zu tc=%.2f cj=%.2f", ch + 1, tc, cj);
+			efiPrintf("max31855 ch=%d tc=%.2f cj=%.2f", (int)(ch + 1), tc, cj);
 		}
 
 		return State::Ok;
@@ -380,8 +382,8 @@ private:
 		if (cjTemp) *cjTemp = m_lastValidCj[ch];
 
 		if (verbose) {
-			efiPrintf("max31855 ch=%zu using cached tc=%.2f cj=%.2f (stale %d/%d)",
-				ch + 1,
+			efiPrintf("max31855 ch=%d using cached tc=%.2f cj=%.2f (stale %d/%d)",
+				(int)(ch + 1),
 				m_lastValidTemp[ch], m_lastValidCj[ch],
 				(int)m_staleCtr[ch], (int)MAX31855_CACHE_STALE_COUNT);
 		}
@@ -422,7 +424,7 @@ void stopMax3185x() {
 }
 
 void startMax3185x(spi_device_e device, egt_cs_array_t max31855_cs) {
-	instance.start(device, max31855_cs);
+	instance.init(device, max31855_cs);
 }
 
 #endif // EFI_MAX_31855
