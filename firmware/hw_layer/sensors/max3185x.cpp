@@ -17,7 +17,7 @@
 #include "stored_value_sensor.h"
 
 #ifndef MAX31855_REFRESH_TIME
-#define MAX31855_REFRESH_TIME 100
+#define MAX31855_REFRESH_TIME 150
 #endif
 
 class Max31855Read final : public ThreadController<UTILITY_THREAD_STACK_SIZE> {
