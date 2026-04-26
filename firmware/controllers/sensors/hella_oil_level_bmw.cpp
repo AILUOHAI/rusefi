@@ -122,8 +122,11 @@ static void hellaOilCallback(efitick_t nowNt, bool isHigh) {
             float diff = highWidth_ms - lastLowWidth_ms;
             if (diff < 0) diff = -diff;
             if (diff > DIAG_MATCH_TOL_MS) {
-                efiPrintf("HELLA DIAG: LOW≠HIGH diff=%.1fms → INVALID frame", diff);
-                // Сбрасываем TEMP контекст — кадр не валиден
+                efiPrintf("HELLA DIAG: LOW≠HIGH diff=%.1fms → zero all", diff);
+                levelSensor.setValidValue(0, nowNt);
+                rawLevelSensor.setValidValue(0, nowNt);
+                tempSensor.setValidValue(0, nowNt);
+                rawTempSensor.setValidValue(0, nowNt);
                 lastTempRise_ms = 0;
                 return;
             }
@@ -133,23 +136,28 @@ static void hellaOilCallback(efitick_t nowNt, bool isHigh) {
 
             if (diagCenter >= (DIAG_NORMAL_MS - DIAG_MATCH_TOL_MS) &&
                 diagCenter <= (DIAG_NORMAL_MS + DIAG_MATCH_TOL_MS)) {
-                // Норма: оба ~40 мс
+                // Норма: оба ~40 мс — данные валидны, расчёты идут штатно
                 diagError = false;
                 efiPrintf("HELLA DIAG: OK (%.1fms)", diagCenter);
 
             } else if (diagCenter >= (DIAG_ERROR_MS - DIAG_MATCH_TOL_MS) &&
                        diagCenter <= (DIAG_ERROR_MS + DIAG_MATCH_TOL_MS)) {
-                // Ошибка уровня: оба ~20 мс — данные невалидны
+                // Ошибка уровня: оба ~20 мс
+                // Температуру всё равно передаём (TEMP импульсы не меняются)
+                // Уровень = 0 (масло ниже минимума)
                 diagError = true;
                 efiPrintf("HELLA DIAG: LOW LEVEL ERROR (%.1fms)", diagCenter);
-                // Инвалидируем сенсор уровня
-                levelSensor.invalidate();
-                rawLevelSensor.invalidate();
+                levelSensor.setValidValue(0, nowNt);
+                rawLevelSensor.setValidValue(0, nowNt);
                 lastTempRise_ms = 0;
 
             } else {
-                // Непонятная длина — мусор
-                efiPrintf("HELLA DIAG: UNKNOWN width=%.1fms → ignore", diagCenter);
+                // Непонятная длина — мусор, всё обнуляем
+                efiPrintf("HELLA DIAG: UNKNOWN width=%.1fms → zero all", diagCenter);
+                levelSensor.setValidValue(0, nowNt);
+                rawLevelSensor.setValidValue(0, nowNt);
+                tempSensor.setValidValue(0, nowNt);
+                rawTempSensor.setValidValue(0, nowNt);
                 lastTempRise_ms = 0;
             }
 
