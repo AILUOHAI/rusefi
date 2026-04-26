@@ -29,10 +29,10 @@
  *
  *  №  Имя    Норма      Ошибка уровня   Что кодирует
  *  ─────────────────────────────────────────────────────────────────────
- *  1  LOW    ~40 ms     ~20 ms          Пауза перед DIAG (должна = DIAG)
- *  2  DIAG   ~40 ms     ~20 ms          Диагностический HIGH импульс
- *  3  TEMP    5..35 ms  не меняется     Ширина кодирует температуру масла
- *  4  LEVEL  50..400 ms зависит         Интервал RISE→RISE между TEMP = уровень масла
+ *  1  LOW    ~40 ms     ~24 ms          Пауза перед DIAG (должна = DIAG)
+ *  2  DIAG   ~40 ms     ~24 ms          Диагностический HIGH импульс
+ *  3  TEMP    5..20 ms  не меняется     Ширина кодирует температуру масла
+ *  4  LEVEL  90..610 ms зависит         Интервал RISE→RISE между TEMP = уровень масла
  *
  * ═══════════════════════════════════════════════════════════════════════
  *  ПРАВИЛА ВАЛИДАЦИИ (выполняются при каждом DIAG FALL):
@@ -42,11 +42,11 @@
  *
  *  2. DIAG_width попадает в одно из двух окон:
  *       37..43 ms → НОРМА     → diagError=false, данные валидны
- *       17..23 ms → ОШИБКА    → diagError=true, level=0, temp передаём
+ *       21..27 ms → ОШИБКА    → diagError=true, level=0, temp передаём
  *       иначе     → МУСОР     → все каналы = 0
  *
  *  При ошибке уровня (масло ниже минимума):
- *    - DIAG и LOW мигают: 20ms/20ms/20ms/20ms...
+ *    - DIAG и LOW мигают: 24ms/24ms/24ms/24ms...
  *    - TEMP импульсы не изменяются → температуру всё равно передаём
  *    - Уровень = 0 мм (масло ниже минимума датчика)
  *
@@ -68,18 +68,18 @@
 // ── Пороги детектирования импульсов (мс) ────────────────────────────────────
 
 // Диапазон TEMP импульсов (кодируют температуру масла)
-static constexpr float TEMP_MIN_MS       =  5.0f;  // мин. допустимая ширина TEMP
-static constexpr float TEMP_MAX_MS       = 20.0f;  // макс. допустимая ширина TEMP
+static constexpr float TEMP_MIN_MS       =  5.0f;  // мин. допустимая ширина TEMP (из логов ~11 мс)
+static constexpr float TEMP_MAX_MS       = 20.0f;  // макс. допустимая ширина TEMP (из логов ~11 мс, запас до 20)
 
 // Ширины DIAG импульса (и LOW паузы перед ним)
 static constexpr float DIAG_NORMAL_MS    = 40.0f;  // нормальная работа: оба ~40 мс
-static constexpr float DIAG_ERROR_MS     = 24.0f;  // ошибка уровня масла: оба ~20 мс
+static constexpr float DIAG_ERROR_MS     = 24.0f;  // ошибка уровня масла: оба ~24 мс
 static constexpr float DIAG_MATCH_TOL_MS =  3.0f;  // допуск: |LOW - DIAG| <= 3 мс
-static constexpr float DIAG_MIN_ABS_MS   = 21.0f;  // ниже — перекрытие с TEMP → мусор
+static constexpr float DIAG_MIN_ABS_MS   = 21.0f;  // ниже этого — перекрытие с TEMP → мусор (TEMP до 20, DIAG от 21)
 
 // Допустимый диапазон интервала между TEMP импульсами (= уровень масла)
-static constexpr float LEVEL_MIN_MS      = 90.0f;  // мин. интервал RISE→RISE
-static constexpr float LEVEL_MAX_MS      = 610.0f; // макс. интервал RISE→RISE
+static constexpr float LEVEL_MIN_MS      = 90.0f;  // мин. интервал RISE→RISE (из логов ~408-446 мс)
+static constexpr float LEVEL_MAX_MS      = 610.0f; // макс. интервал RISE→RISE (запас сверху)
 
 // ── Состояние парсера (живёт на всё время работы) ───────────────────────────
 static int   cb_num          = 0;     // счётчик EXTI прерываний (для отладки)
@@ -129,7 +129,7 @@ static void hellaOilCallback(efitick_t nowNt, bool isHigh) {
         efiPrintf("HELLA #%d FALL: HIGH=%.1fms LOW_before=%.1fms", cb_num, highWidth_ms, lastLowWidth_ms);
 
         // ════════════════════════════════════════════════════════════════════
-        //  TEMP импульс: 5..35 мс
+        //  TEMP импульс: 5..20 мс
         //  Ширина линейно кодирует температуру масла.
         //  Calibration: hellaOilLevel.{min/max}PulseUsTemp (хранятся в мс)
         // ════════════════════════════════════════════════════════════════════
@@ -225,7 +225,7 @@ static void hellaOilCallback(efitick_t nowNt, bool isHigh) {
 
             } else if (diagCenter >= (DIAG_ERROR_MS - DIAG_MATCH_TOL_MS) &&
                        diagCenter <= (DIAG_ERROR_MS + DIAG_MATCH_TOL_MS)) {
-                // Ошибка уровня масла: LOW ~20 мс, DIAG ~20 мс, мигание
+                // Ошибка уровня масла: LOW ~24 мс, DIAG ~24 мс, мигание
                 // Уровень будет принудительно 0 при следующем TEMP.
                 // Температуру продолжаем передавать — TEMP импульсы не меняются.
                 // lastTempRise_ms НЕ сбрасываем — иначе следующий LEVEL интервал
