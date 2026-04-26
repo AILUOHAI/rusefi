@@ -206,7 +206,7 @@ private:
         // Retry once after short delay if all zeros received
         uint32_t firstRead = ((uint32_t)rx[0] << 24) | ((uint32_t)rx[1] << 16) | ((uint32_t)rx[2] << 8) | rx[3];
         if (firstRead == 0x00000000 || firstRead == 0xFFFFFFFF) {
-            chThdSleepMilliseconds205);
+            chThdSleepMilliseconds(20););
             uint8_t rx2[4] = { 0, 0, 0, 0 };
             spiTxRx(channel, tx, rx2, 4);
             rx[0] = rx2[0]; rx[1] = rx2[1]; rx[2] = rx2[2]; rx[3] = rx2[3];
