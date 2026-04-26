@@ -182,15 +182,20 @@ private:
 	}
 
 	/**
-	 * Proper SPI transaction with bus mutex.
-	 * spiAcquireBus prevents concurrent access from SD card / GPIO expanders
-	 * running on the same SPI bus — that was the root cause of 0x00000000 reads.
+	 * SPI transaction using polled exchange (byte-by-byte, no DMA).
+	 *
+	 * On STM32F7 D-cache is enabled. spiExchange() uses DMA which writes to
+	 * physical RAM, but the CPU reads from cache and sees stale zeros.
+	 * All 4-byte SPI reads (ADC, GPIO expanders in this project) that do NOT
+	 * use NO_CACHE buffers suffer from this. spiPolledExchange is the correct
+	 * fix for small transfers: it bypasses DMA entirely, reading directly from
+	 * the SPI DR register, so cache coherency is not an issue.
 	 */
-	int spiTxRx(size_t channel, const uint8_t* tx, uint8_t* rx, size_t n) {
+	uint32_t spiRxPolled32(size_t channel) {
 		brain_pin_e cs = m_cs[channel];
 
 		if (!isBrainPinValid(cs) || driver == nullptr) {
-			return -1;
+			return 0xDEADBEEF; /* sentinel — caller checks for this */
 		}
 
 		initSpiCsNoOccupy(&spiConfig, cs);
@@ -201,53 +206,48 @@ private:
 		spiStart(driver, &spiConfig);
 		/* CS low */
 		spiSelect(driver);
-		/* Transfer */
-		spiExchange(driver, n, tx, rx);
+
+		/* Read 4 bytes via polled exchange — no DMA, no cache issues */
+		uint32_t raw = 0;
+		raw |= ((uint32_t)spiPolledExchange(driver, 0x00) << 24);
+		raw |= ((uint32_t)spiPolledExchange(driver, 0x00) << 16);
+		raw |= ((uint32_t)spiPolledExchange(driver, 0x00) << 8);
+		raw |= ((uint32_t)spiPolledExchange(driver, 0x00) << 0);
+
 		/* CS high */
 		spiUnselect(driver);
 		/* Release bus mutex */
 		spiReleaseBus(driver);
 
-		return 0;
+		return raw;
 	}
 
 	int spiRx32(size_t channel, uint32_t* data, uint8_t* rawBytes) {
-		uint8_t tx[4] = { 0, 0, 0, 0 };
-		uint8_t rx[4] = { 0, 0, 0, 0 };
+		uint32_t raw = spiRxPolled32(channel);
 
-		int ret = spiTxRx(channel, tx, rx, 4);
-		if (ret) {
-			return ret;
+		/* spiRxPolled32 returns 0xDEADBEEF on config error */
+		if (raw == 0xDEADBEEF) {
+			return -1;
 		}
-
-		uint32_t raw = ((uint32_t)rx[0] << 24) |
-		               ((uint32_t)rx[1] << 16) |
-		               ((uint32_t)rx[2] << 8)  |
-		               ((uint32_t)rx[3] << 0);
 
 		/*
 		 * MAX31855 outputs all-zeros for ~1ms during internal ADC conversion
-		 * (happens once per ~100ms conversion cycle).
-		 * Single retry after 2ms is enough — no need for multiple retries
-		 * now that bus contention is fixed.
+		 * (happens once per ~100ms conversion cycle). Single retry after 2ms.
+		 * With polled exchange this is rare but keep for robustness.
 		 */
 		if (raw == 0x00000000 || raw == 0xFFFFFFFF) {
 			chThdSleepMilliseconds(2);
-			uint8_t rx2[4] = { 0, 0, 0, 0 };
-			spiTxRx(channel, tx, rx2, 4);
-			rx[0] = rx2[0]; rx[1] = rx2[1];
-			rx[2] = rx2[2]; rx[3] = rx2[3];
-			raw = ((uint32_t)rx[0] << 24) |
-			      ((uint32_t)rx[1] << 16) |
-			      ((uint32_t)rx[2] << 8)  |
-			      ((uint32_t)rx[3] << 0);
+			raw = spiRxPolled32(channel);
+			if (raw == 0xDEADBEEF) {
+				return -1;
+			}
 		}
 
 		if (rawBytes) {
-			rawBytes[0] = rx[0];
-			rawBytes[1] = rx[1];
-			rawBytes[2] = rx[2];
-			rawBytes[3] = rx[3];
+			rawBytes[0] = (raw >> 24) & 0xFF;
+			rawBytes[1] = (raw >> 16) & 0xFF;
+			rawBytes[2] = (raw >> 8)  & 0xFF;
+			rawBytes[3] = (raw >> 0)  & 0xFF;
 		}
 
 		if (data) {
