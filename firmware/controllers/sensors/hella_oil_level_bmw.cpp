@@ -69,17 +69,17 @@
 
 // Диапазон TEMP импульсов (кодируют температуру масла)
 static constexpr float TEMP_MIN_MS       =  5.0f;  // мин. допустимая ширина TEMP
-static constexpr float TEMP_MAX_MS       = 35.0f;  // макс. допустимая ширина TEMP
+static constexpr float TEMP_MAX_MS       = 20.0f;  // макс. допустимая ширина TEMP
 
 // Ширины DIAG импульса (и LOW паузы перед ним)
 static constexpr float DIAG_NORMAL_MS    = 40.0f;  // нормальная работа: оба ~40 мс
-static constexpr float DIAG_ERROR_MS     = 20.0f;  // ошибка уровня масла: оба ~20 мс
+static constexpr float DIAG_ERROR_MS     = 24.0f;  // ошибка уровня масла: оба ~20 мс
 static constexpr float DIAG_MATCH_TOL_MS =  3.0f;  // допуск: |LOW - DIAG| <= 3 мс
-static constexpr float DIAG_MIN_ABS_MS   = 17.0f;  // ниже — перекрытие с TEMP → мусор
+static constexpr float DIAG_MIN_ABS_MS   = 21.0f;  // ниже — перекрытие с TEMP → мусор
 
 // Допустимый диапазон интервала между TEMP импульсами (= уровень масла)
-static constexpr float LEVEL_MIN_MS      = 20.0f;  // мин. интервал RISE→RISE
-static constexpr float LEVEL_MAX_MS      = 400.0f; // макс. интервал RISE→RISE
+static constexpr float LEVEL_MIN_MS      = 90.0f;  // мин. интервал RISE→RISE
+static constexpr float LEVEL_MAX_MS      = 610.0f; // макс. интервал RISE→RISE
 
 // ── Состояние парсера (живёт на всё время работы) ───────────────────────────
 static int   cb_num          = 0;     // счётчик EXTI прерываний (для отладки)
