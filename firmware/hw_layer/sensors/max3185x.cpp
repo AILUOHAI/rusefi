@@ -1,6 +1,10 @@
 /**
  * @file max3185x.cpp
- * @brief MAX31855 only thermocouple driver with raw SPI debug
+ * @brief MAX31855 thermocouple driver
+ *
+ * Fix: use proper spiAcquireBus/spiReleaseBus to prevent bus contention
+ *      with other SPI devices (SD card, GPIO expanders, etc.)
+ *      This was root cause of intermittent 0x00000000 reads.
  */
 
 #include "pch.h"
@@ -40,12 +44,9 @@ public:
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			m_cs[i] = Gpio::Invalid;
-		}
-
-    		// Initialize cache arrays
-		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			m_lastValidTemp[i] = 0.0f;
 			m_lastValidColdJunction[i] = 0.0f;
+			m_hasValidCache[i] = false;
 		}
 
 		if (!driver) {
@@ -67,19 +68,21 @@ public:
 			}
 		}
 
-      
-
-        		ThreadController::start();
+		ThreadController::start();
 		return 0;
-	}	void stop() {
-		        if (driver) spiStop(driver);
-ThreadController::stop();
+	}
+
+	void stop() {
+		ThreadController::stop();
+
+		if (driver) {
+			spiStop(driver);
+		}
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			if (!isBrainPinValid(m_cs[i])) {
 				continue;
 			}
-
 			brain_pin_markUnused(m_cs[i]);
 			egtSensors[i].unregister();
 		}
@@ -143,6 +146,7 @@ private:
 	SPIDriver* driver = nullptr;
 	float m_lastValidTemp[EGT_CHANNEL_COUNT];
 	float m_lastValidColdJunction[EGT_CHANNEL_COUNT];
+	bool m_hasValidCache[EGT_CHANNEL_COUNT];
 
 	SPIConfig spiConfig = {
 		.circular = false,
@@ -159,7 +163,7 @@ private:
 			SPI_CR1_8BIT_MODE |
 			SPI_CR1_SSM |
 			SPI_CR1_SSI |
-			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |
+			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |	/* prescaler /64, ~843kHz on F7@216MHz/APB2 */
 			SPI_CR1_MSTR |
 			0,
 		.cr2 = SPI_CR2_8BIT_MODE
@@ -167,16 +171,21 @@ private:
 
 	const char* getErrorName(Max31855State code) {
 		switch (code) {
-		case MAX31855_OK: return "Ok";
+		case MAX31855_OK:           return "Ok";
 		case MAX31855_OPEN_CIRCUIT: return "Open";
 		case MAX31855_SHORT_TO_GND: return "short gnd";
 		case MAX31855_SHORT_TO_VCC: return "short VCC";
-		case MAX31855_NO_REPLY: return "no reply";
-		case MAX31855_NOT_ENABLED: return "not enabled";
-		default: return "invalid";
+		case MAX31855_NO_REPLY:     return "no reply";
+		case MAX31855_NOT_ENABLED:  return "not enabled";
+		default:                    return "invalid";
 		}
 	}
 
+	/**
+	 * Proper SPI transaction with bus mutex.
+	 * spiAcquireBus prevents concurrent access from SD card / GPIO expanders
+	 * running on the same SPI bus — that was the root cause of 0x00000000 reads.
+	 */
 	int spiTxRx(size_t channel, const uint8_t* tx, uint8_t* rx, size_t n) {
 		brain_pin_e cs = m_cs[channel];
 
@@ -186,13 +195,18 @@ private:
 
 		initSpiCsNoOccupy(&spiConfig, cs);
 
+		/* Acquire ownership of the bus (blocks until free) */
+		spiAcquireBus(driver);
+		/* (Re-)apply config — needed if another device changed CR1/CR2 */
 		spiStart(driver, &spiConfig);
-	
+		/* CS low */
 		spiSelect(driver);
+		/* Transfer */
 		spiExchange(driver, n, tx, rx);
+		/* CS high */
 		spiUnselect(driver);
-          
-		// spiReleaseBus removed - using spiStart per transaction
+		/* Release bus mutex */
+		spiReleaseBus(driver);
 
 		return 0;
 	}
@@ -205,24 +219,29 @@ private:
 		if (ret) {
 			return ret;
 		}
-    
-        // MAX31855 outputs 0x00000000 during internal conversion (~1ms every 100ms)
-        // Retry once after short delay if all zeros received
-        uint32_t firstRead = ((uint32_t)rx[0] << 24) | ((uint32_t)rx[1] << 16) | ((uint32_t)rx[2] << 8) | rx[3];
-        if (firstRead == 0x00000000 || firstRead == 0xFFFFFFFF) {
-            chThdSleepMilliseconds(20);
-            uint8_t rx2[4] = { 0, 0, 0, 0 };
-            spiTxRx(channel, tx, rx2, 4);
-            rx[0] = rx2[0]; rx[1] = rx2[1]; rx[2] = rx2[2]; rx[3] = rx2[3];
-			// If still zero after first retry, try once more
-			uint32_t secondRead = ((uint32_t)rx[0] << 24) | ((uint32_t)rx[1] << 16) | ((uint32_t)rx[2] << 8) | rx[3];
-			if (secondRead == 0x00000000 || secondRead == 0xFFFFFFFF) {
-				chThdSleepMilliseconds(20);
-				uint8_t rx3[4] = { 0, 0, 0, 0 };
-				spiTxRx(channel, tx, rx3, 4);
-				rx[0] = rx3[0]; rx[1] = rx3[1]; rx[2] = rx3[2]; rx[3] = rx3[3];
-			}
-        }
+
+		uint32_t raw = ((uint32_t)rx[0] << 24) |
+		               ((uint32_t)rx[1] << 16) |
+		               ((uint32_t)rx[2] << 8)  |
+		               ((uint32_t)rx[3] << 0);
+
+		/*
+		 * MAX31855 outputs all-zeros for ~1ms during internal ADC conversion
+		 * (happens once per ~100ms conversion cycle).
+		 * Single retry after 2ms is enough — no need for multiple retries
+		 * now that bus contention is fixed.
+		 */
+		if (raw == 0x00000000 || raw == 0xFFFFFFFF) {
+			chThdSleepMilliseconds(2);
+			uint8_t rx2[4] = { 0, 0, 0, 0 };
+			spiTxRx(channel, tx, rx2, 4);
+			rx[0] = rx2[0]; rx[1] = rx2[1];
+			rx[2] = rx2[2]; rx[3] = rx2[3];
+			raw = ((uint32_t)rx[0] << 24) |
+			      ((uint32_t)rx[1] << 16) |
+			      ((uint32_t)rx[2] << 8)  |
+			      ((uint32_t)rx[3] << 0);
+		}
 
 		if (rawBytes) {
 			rawBytes[0] = rx[0];
@@ -232,11 +251,7 @@ private:
 		}
 
 		if (data) {
-			*data =
-				((uint32_t)rx[0] << 24) |
-				((uint32_t)rx[1] << 16) |
-				((uint32_t)rx[2] << 8) |
-				((uint32_t)rx[3] << 0);
+			*data = raw;
 		}
 
 		return 0;
@@ -248,32 +263,28 @@ private:
 		}
 
 		if (packet & BIT(16)) {
-			if (packet & BIT(0)) {
-				return MAX31855_OPEN_CIRCUIT;
-			}
-			if (packet & BIT(1)) {
-				return MAX31855_SHORT_TO_GND;
-			}
-			if (packet & BIT(2)) {
-				return MAX31855_SHORT_TO_VCC;
-			}
+			if (packet & BIT(0)) return MAX31855_OPEN_CIRCUIT;
+			if (packet & BIT(1)) return MAX31855_SHORT_TO_GND;
+			if (packet & BIT(2)) return MAX31855_SHORT_TO_VCC;
 		}
 
 		return MAX31855_OK;
 	}
 
 	float decodeThermocouple(uint32_t packet) {
+		/* Bits [31:18]: 14-bit signed thermocouple temperature, 0.25°C/LSB */
 		int16_t v = (int16_t)((packet >> 18) & 0x3FFF);
 		if (v & 0x2000) {
-			v |= 0xC000;
+			v |= 0xC000; /* sign extend */
 		}
 		return v * 0.25f;
 	}
 
 	float decodeColdJunction(uint32_t packet) {
+		/* Bits [15:4]: 12-bit signed cold-junction temperature, 0.0625°C/LSB */
 		int16_t v = (int16_t)((packet >> 4) & 0x0FFF);
 		if (v & 0x0800) {
-			v |= 0xF000;
+			v |= 0xF000; /* sign extend */
 		}
 		return v * 0.0625f;
 	}
@@ -301,6 +312,12 @@ private:
 		}
 
 		if (ret != 0) {
+			/* SPI call itself failed */
+			if (m_hasValidCache[channel]) {
+				if (temp)            *temp = m_lastValidTemp[channel];
+				if (coldJunctionTemp) *coldJunctionTemp = m_lastValidColdJunction[channel];
+				return MAX31855_OK;
+			}
 			return MAX31855_NO_REPLY;
 		}
 
@@ -310,9 +327,28 @@ private:
 			efiPrintf("max31855 ch=%d fault=%d oc=%d scg=%d scv=%d",
 				(int)channel + 1,
 				(packet & BIT(16)) ? 1 : 0,
-				(packet & BIT(0)) ? 1 : 0,
-				(packet & BIT(1)) ? 1 : 0,
-				(packet & BIT(2)) ? 1 : 0);
+				(packet & BIT(0))  ? 1 : 0,
+				(packet & BIT(1))  ? 1 : 0,
+				(packet & BIT(2))  ? 1 : 0);
+		}
+
+		if (code == MAX31855_NO_REPLY) {
+			/*
+			 * Still getting zeros after retry — use last known good value
+			 * so the sensor doesn't drop out momentarily.
+			 */
+			if (m_hasValidCache[channel]) {
+				if (temp)            *temp = m_lastValidTemp[channel];
+				if (coldJunctionTemp) *coldJunctionTemp = m_lastValidColdJunction[channel];
+				if (verbose) {
+					efiPrintf("max31855 ch=%d using cached tc=%.2f cj=%.2f",
+						(int)channel + 1,
+						m_lastValidTemp[channel],
+						m_lastValidColdJunction[channel]);
+				}
+				return MAX31855_OK;
+			}
+			return MAX31855_NO_REPLY;
 		}
 
 		if (code != MAX31855_OK) {
@@ -321,32 +357,18 @@ private:
 
 		float tc = decodeThermocouple(packet);
 		float cj = decodeColdJunction(packet);
-    
-	// Cache valid values; if zero read, use last valid
-	if (code == MAX31855_OK) {
+
+		/* Update cache with fresh valid reading */
 		m_lastValidTemp[channel] = tc;
 		m_lastValidColdJunction[channel] = cj;
-	} else if (code == MAX31855_NO_REPLY) {
-		// Use cached value on zero/no-reply
-		tc = m_lastValidTemp[channel];
-		cj = m_lastValidColdJunction[channel];
-		code = MAX31855_OK;  // Pretend OK since we have cached value
-	}
+		m_hasValidCache[channel] = true;
 
-		if (temp) {
-			*temp = tc;
-		}
-
-		if (coldJunctionTemp) {
-			*coldJunctionTemp = cj;
-  
-		}
+		if (temp)            *temp = tc;
+		if (coldJunctionTemp) *coldJunctionTemp = cj;
 
 		if (verbose) {
 			efiPrintf("max31855 ch=%d tc=%.2f cj=%.2f",
-				(int)channel + 1,
-				tc,
-				cj);
+				(int)channel + 1, tc, cj);
 		}
 
 		return MAX31855_OK;
