@@ -19,7 +19,7 @@ static Gpio hellaPin = Gpio::Unassigned;
 static void hellaOilCallback(efitick_t nowNt, bool value) {
     cb_num++;
     // nowNt в наносекундах → переводим в миллисекунды
-    float t_ms = NT2MS(nowNt);
+    float t_ms = NT2US(nowNt) / 1000.0f;
 
     if (value) {  // RISE
         lastRise_ms = t_ms;
