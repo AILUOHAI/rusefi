@@ -42,11 +42,15 @@ public:
 			m_cs[i] = Gpio::Invalid;
 		}
 
+    		// Initialize cache arrays
+		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
+			m_lastValidTemp[i] = 0.0f;
+			m_lastValidColdJunction[i] = 0.0f;
+		}
+
 		if (!driver) {
 			efiPrintf("MAX31855: no SPI driver for device %d", (int)device);
 			return -1;
-      		m_lastValidTemp[i] = 0.0f;
-		m_lastValidColdJunction[i] = 0.0f;
 		}
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
@@ -137,11 +141,11 @@ ThreadController::stop();
 private:
 	brain_pin_e m_cs[EGT_CHANNEL_COUNT];
 	SPIDriver* driver = nullptr;
+	float m_lastValidTemp[EGT_CHANNEL_COUNT];
+	float m_lastValidColdJunction[EGT_CHANNEL_COUNT];
 
 	SPIConfig spiConfig = {
 		.circular = false,
-	float m_lastValidTemp[EGT_CHANNEL_COUNT];
-	float m_lastValidColdJunction[EGT_CHANNEL_COUNT];
 #ifdef _CHIBIOS_RT_CONF_VER_6_1_
 		.end_cb = nullptr,
 #else
@@ -206,7 +210,7 @@ private:
         // Retry once after short delay if all zeros received
         uint32_t firstRead = ((uint32_t)rx[0] << 24) | ((uint32_t)rx[1] << 16) | ((uint32_t)rx[2] << 8) | rx[3];
         if (firstRead == 0x00000000 || firstRead == 0xFFFFFFFF) {
-            chThdSleepMilliseconds(20););
+            chThdSleepMilliseconds(20);
             uint8_t rx2[4] = { 0, 0, 0, 0 };
             spiTxRx(channel, tx, rx2, 4);
             rx[0] = rx2[0]; rx[1] = rx2[1]; rx[2] = rx2[2]; rx[3] = rx2[3];
