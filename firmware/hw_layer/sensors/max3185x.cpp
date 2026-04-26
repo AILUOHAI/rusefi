@@ -45,6 +45,8 @@ public:
 		if (!driver) {
 			efiPrintf("MAX31855: no SPI driver for device %d", (int)device);
 			return -1;
+      		m_lastValidTemp[i] = 0.0f;
+		m_lastValidColdJunction[i] = 0.0f;
 		}
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
@@ -138,6 +140,8 @@ private:
 
 	SPIConfig spiConfig = {
 		.circular = false,
+	float m_lastValidTemp[EGT_CHANNEL_COUNT];
+	float m_lastValidColdJunction[EGT_CHANNEL_COUNT];
 #ifdef _CHIBIOS_RT_CONF_VER_6_1_
 		.end_cb = nullptr,
 #else
@@ -313,6 +317,17 @@ private:
 
 		float tc = decodeThermocouple(packet);
 		float cj = decodeColdJunction(packet);
+    
+	// Cache valid values; if zero read, use last valid
+	if (code == MAX31855_OK) {
+		m_lastValidTemp[channel] = tc;
+		m_lastValidColdJunction[channel] = cj;
+	} else if (code == MAX31855_NO_REPLY) {
+		// Use cached value on zero/no-reply
+		tc = m_lastValidTemp[channel];
+		cj = m_lastValidColdJunction[channel];
+		code = MAX31855_OK;  // Pretend OK since we have cached value
+	}
 
 		if (temp) {
 			*temp = tc;
