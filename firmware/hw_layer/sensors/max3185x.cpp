@@ -1,47 +1,53 @@
 /**
  * @file max3185x.cpp
- * @brief MAX31855 and MAX31856 Thermocouple-to-Digital Converter driver
+ * @brief MAX31855 thermocouple driver for rusefi / Proteus F7
  *
+ * Root causes fixed:
+ *  1. STM32F7 D-cache coherency: spiExchange() uses DMA → CPU reads stale
+ *     cache = zeros. Fixed by spiPolledExchange() which reads SPI DR directly.
+ *  2. Bus contention: spiAcquireBus/spiReleaseBus mutex wraps every transfer.
  *
- * http://datasheets.maximintegrated.com/en/ds/MAX31855.pdf
- * https://www.analog.com/media/en/technical-documentation/data-sheets/MAX31856.pdf
- *
- *
- * Read-only (MAX31855), RW (MAX31956) communication over 5MHz SPI
- *
- * @date Sep 17, 2014
- * @author Andrey Belomutskiy, (c) 2012-2020
- *
- * @author Andrey Gusakov, 2024
- *
- */
-
-/**
- * @file max3185x.cpp
- * @brief MAX31855 only thermocouple driver with raw SPI debug
- */
-
-/**
- * @file max3185x.cpp
- * @brief MAX31855 only thermocouple driver with raw SPI debug
+ * Design notes:
+ *  - Sentinel value 0xDEADBEEF is never a valid MAX31855 packet: bits D17
+ *    and D3 are always zero in valid packets; DEADBEEF has both set.
+ *  - Cache holds last known-good value so dropouts < STALE_TIMEOUT_MS are
+ *    transparent to the rest of the firmware.
+ *  - MAX31855 conversion window is ~1 ms per 100 ms cycle. One 2 ms retry
+ *    is enough to bridge it without blocking the thread too long.
  */
 
 #include "pch.h"
+
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+
 #include "max3185x.h"
 #include "hardware.h"
-
-#if EFI_PROD_CODE
-#include "mpu_util.h"
-#endif
 
 #if EFI_MAX_31855
 
 #include "thread_controller.h"
 #include "stored_value_sensor.h"
 
+// Polling period. MAX31855 updates every ~100 ms; 150 ms gives one missed
+// conversion before the stale-value timeout (3× = 450 ms) triggers.
 #ifndef MAX31855_REFRESH_TIME
-#define MAX31855_REFRESH_TIME 100
+#define MAX31855_REFRESH_TIME 150
 #endif
+
+// How many consecutive NO_REPLY reads before we invalidate the cached value
+// and report an actual error upstream. At 150 ms polling → ~2.25 s grace.
+#ifndef MAX31855_CACHE_STALE_COUNT
+#define MAX31855_CACHE_STALE_COUNT 15
+#endif
+
+// SPI clock prescaler for SPI5 on STM32F7 @ 216 MHz (APB2 = 108 MHz):
+//   BR[2:0] = 5 → ÷64 → ~1.69 MHz  (MAX31855 max is 5 MHz, well within spec)
+#define MAX31855_SPI_PRESCALER ((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR)
+
+// Sentinel: bits D17 and D3 are always 0 in any valid MAX31855 packet,
+// but both are 1 in 0xDEADBEEF → safe to use as an error marker.
+static constexpr uint32_t SPI_ERROR_SENTINEL = 0xDEADBEEFu;
 
 class Max31855Read final : public ThreadController<UTILITY_THREAD_STACK_SIZE> {
 public:
@@ -49,34 +55,36 @@ public:
 		: ThreadController("MAX31855", MAX31855_PRIO) {
 	}
 
-	enum Max31855State {
-		MAX31855_OK = 0,
-		MAX31855_OPEN_CIRCUIT = 1,
-		MAX31855_SHORT_TO_GND = 2,
-		MAX31855_SHORT_TO_VCC = 3,
-		MAX31855_NO_REPLY = 4,
-		MAX31855_NOT_ENABLED = 5,
+	enum class State : uint8_t {
+		Ok          = 0,
+		OpenCircuit = 1,
+		ShortToGnd  = 2,
+		ShortToVcc  = 3,
+		NoReply     = 4,
+		NotEnabled  = 5,
 	};
 
-	int start(spi_device_e device, egt_cs_array_t cs) {
+	int init(spi_device_e device, egt_cs_array_t cs) {
 		driver = getSpiDevice(device);
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-			m_cs[i] = Gpio::Invalid;
+			m_cs[i]               = Gpio::Invalid;
+			m_lastValidTemp[i]    = 0.0f;
+			m_lastValidCj[i]      = 0.0f;
+			m_staleCtr[i]         = 0;
+			m_hasValidCache[i]    = false;
 		}
 
 		if (!driver) {
-			efiPrintf("MAX31855: no SPI driver for device %d", device);
+			efiPrintf("MAX31855: no SPI driver for device %d", (int)device);
 			return -1;
 		}
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			auto& sensor = egtSensors[i];
-
 			if (Sensor::hasSensor(sensor.type())) {
 				continue;
 			}
-
 			if (isBrainPinValid(cs[i])) {
 				initSpiCs(&spiConfig, cs[i]);
 				m_cs[i] = cs[i];
@@ -91,11 +99,14 @@ public:
 	void stop() {
 		ThreadController::stop();
 
+		if (driver) {
+			spiStop(driver);
+		}
+
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			if (!isBrainPinValid(m_cs[i])) {
 				continue;
 			}
-
 			brain_pin_markUnused(m_cs[i]);
 			egtSensors[i].unregister();
 		}
@@ -104,9 +115,10 @@ public:
 	void ThreadTask() override {
 		while (!chThdShouldTerminateX()) {
 			for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-				float value = 0;
-				Max31855State ret = readChannel(i, &value, nullptr, false);
-				if (ret == MAX31855_OK) {
+				float value = 0.0f;
+				State ret = readChannel(i, &value, nullptr, /*verbose=*/false);
+
+				if (ret == State::Ok) {
 					egtSensors[i].setValidValue(value, getTimeNowNt());
 				}
 			}
@@ -118,21 +130,19 @@ public:
 	}
 
 	void showEgtInfo() {
-#if EFI_PROD_CODE
 		printSpiState();
 		efiPrintf("EGT driver: %s", driver ? "OK" : "NULL");
-		efiPrintf("EGT spi: %d", engineConfiguration->max31855spiDevice);
+		efiPrintf("EGT spi: %d", (int)engineConfiguration->max31855spiDevice);
 
-		for (int i = 0; i < EGT_CHANNEL_COUNT; i++) {
+		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
 			if (isBrainPinValid(m_cs[i])) {
-				efiPrintf("EGT CS %d @%s", i + 1, hwPortname(m_cs[i]));
+				efiPrintf("EGT CS %d @%s", (int)(i + 1), hwPortname(m_cs[i]));
 			}
 		}
-#endif
 	}
 
 	void egtRead() {
-		if (driver == nullptr) {
+		if (!driver) {
 			efiPrintf("MAX31855: no SPI selected");
 			return;
 		}
@@ -140,193 +150,250 @@ public:
 		efiPrintf("Reading egt(s)");
 
 		for (size_t i = 0; i < EGT_CHANNEL_COUNT; i++) {
-			float temp = 0;
-			float refTemp = 0;
-			Max31855State code = readChannel(i, &temp, &refTemp, true);
+			float temp = 0.0f;
+			float refTemp = 0.0f;
+			State code = readChannel(i, &temp, &refTemp, /*verbose=*/true);
 
 			efiPrintf("egt%d: type max31855, code=%d (%s)",
-				(int)i + 1,
-				code,
-				getErrorName(code));
+				(int)(i + 1), (int)code, stateName(code));
 
-			if (code == MAX31855_OK) {
+			if (code == State::Ok) {
 				efiPrintf(" temperature %.4f reference temperature %.2f", temp, refTemp);
 			}
 		}
 	}
 
 private:
-	static constexpr uint32_t MAX31855_RESERVED_BITS = 0x00020008;
+	brain_pin_e  m_cs[EGT_CHANNEL_COUNT];
+	SPIDriver*   driver = nullptr;
 
-	brain_pin_e m_cs[EGT_CHANNEL_COUNT];
-	SPIDriver* driver = nullptr;
+	// Cache — last successfully decoded reading per channel
+	float  m_lastValidTemp[EGT_CHANNEL_COUNT];
+	float  m_lastValidCj[EGT_CHANNEL_COUNT];
+	uint8_t m_staleCtr[EGT_CHANNEL_COUNT];   // consecutive no-reply count
+	bool   m_hasValidCache[EGT_CHANNEL_COUNT];
 
 	SPIConfig spiConfig = {
 		.circular = false,
 #ifdef _CHIBIOS_RT_CONF_VER_6_1_
-		.end_cb = nullptr,
+		.end_cb  = nullptr,
 #else
-		.slave = false,
-		.data_cb = nullptr,
+		.slave    = false,
+		.data_cb  = nullptr,
 		.error_cb = nullptr,
 #endif
 		.ssport = nullptr,
-		.sspad = 0,
+		.sspad  = 0,
 		.cr1 =
-			SPI_CR1_8BIT_MODE |
-			SPI_CR1_SSM |
-			SPI_CR1_SSI |
-			((5 << SPI_CR1_BR_Pos) & SPI_CR1_BR) |
-			SPI_CR1_MSTR |
-			0,
+			SPI_CR1_8BIT_MODE        |
+			SPI_CR1_SSM              |
+			SPI_CR1_SSI              |
+			MAX31855_SPI_PRESCALER   |
+			SPI_CR1_MSTR,
 		.cr2 = SPI_CR2_8BIT_MODE
 	};
 
-	const char* getErrorName(Max31855State code) {
-		switch (code) {
-		case MAX31855_OK: return "Ok";
-		case MAX31855_OPEN_CIRCUIT: return "Open";
-		case MAX31855_SHORT_TO_GND: return "short gnd";
-		case MAX31855_SHORT_TO_VCC: return "short VCC";
-		case MAX31855_NO_REPLY: return "no reply";
-		case MAX31855_NOT_ENABLED: return "not enabled";
-		default: return "invalid";
+	// ------------------------------------------------------------------ //
+	//  Helpers
+	// ------------------------------------------------------------------ //
+
+	static const char* stateName(State s) {
+		switch (s) {
+		case State::Ok:          return "Ok";
+		case State::OpenCircuit: return "Open circuit";
+		case State::ShortToGnd:  return "Short to GND";
+		case State::ShortToVcc:  return "Short to VCC";
+		case State::NoReply:     return "No reply";
+		case State::NotEnabled:  return "Not enabled";
+		default:                 return "Unknown";
 		}
 	}
 
-	int spiTxRx(size_t channel, const uint8_t* tx, uint8_t* rx, size_t n) {
-		brain_pin_e cs = m_cs[channel];
-
-		if (!isBrainPinValid(cs) || driver == nullptr) {
-			return -1;
+	/**
+	 * Read 32 bits from MAX31855 via polled (non-DMA) SPI exchange.
+	 *
+	 * WHY polled instead of spiExchange (DMA):
+	 *   STM32F7 has D-cache enabled. spiExchange writes received bytes to
+	 *   physical SRAM via DMA, but the CPU sees the old cache line (zeros).
+	 *   The fix is either NO_CACHE buffers or bypassing DMA altogether.
+	 *   For 4 bytes, polled transfer costs ~19 µs at 1.69 MHz — negligible
+	 *   compared to the 150 ms polling period, and simpler than NO_CACHE.
+	 *
+	 * Returns SPI_ERROR_SENTINEL on driver/pin error (never a valid packet).
+	 */
+	uint32_t readRaw32(size_t ch) {
+		if (!isBrainPinValid(m_cs[ch]) || !driver) {
+			return SPI_ERROR_SENTINEL;
 		}
 
-		initSpiCsNoOccupy(&spiConfig, cs);
+		initSpiCsNoOccupy(&spiConfig, m_cs[ch]);
 
-		spiAcquireBus(driver);
-		spiStart(driver, &spiConfig);
-		spiSelect(driver);
-		spiExchange(driver, n, tx, rx);
-		spiUnselect(driver);
-		spiStop(driver);
-		spiReleaseBus(driver);
+		spiAcquireBus(driver);              // grab bus mutex
+		spiStart(driver, &spiConfig);       // re-apply config (another device may have changed CR1)
+		spiSelect(driver);                  // CS low
 
-		return 0;
+		uint32_t raw =
+			((uint32_t)spiPolledExchange(driver, 0) << 24) |
+			((uint32_t)spiPolledExchange(driver, 0) << 16) |
+			((uint32_t)spiPolledExchange(driver, 0) <<  8) |
+			((uint32_t)spiPolledExchange(driver, 0) <<  0);
+
+		spiUnselect(driver);                // CS high
+		spiReleaseBus(driver);              // release mutex
+
+		return raw;
 	}
 
-	int spiRx32(size_t channel, uint32_t* data) {
-		uint8_t tx[4] = { 0, 0, 0, 0 };
-		uint8_t rx[4] = { 0, 0, 0, 0 };
-
-		int ret = spiTxRx(channel, tx, rx, 4);
-		if (ret) {
-			return ret;
+	/**
+	 * Read with one retry for the ~1 ms conversion gap.
+	 * Returns SPI_ERROR_SENTINEL on hard error, otherwise the raw 32-bit word.
+	 */
+	uint32_t readRaw32WithRetry(size_t ch) {
+		uint32_t raw = readRaw32(ch);
+		if (raw == SPI_ERROR_SENTINEL) {
+			return raw;
 		}
 
-		if (data) {
-			*data =
-				((uint32_t)rx[0] << 24) |
-				((uint32_t)rx[1] << 16) |
-				((uint32_t)rx[2] << 8) |
-				((uint32_t)rx[3] << 0);
+		if (raw == 0x00000000u || raw == 0xFFFFFFFFu) {
+			chThdSleepMilliseconds(2);
+			raw = readRaw32(ch);
 		}
 
-		return 0;
+		return raw;
 	}
 
-	Max31855State decodeFault(uint32_t packet) {
-		const bool reservedBad = (packet & MAX31855_RESERVED_BITS) != 0;
-		const bool allZero = packet == 0x00000000;
-		const bool allOne = packet == 0xFFFFFFFF;
+	// ------------------------------------------------------------------ //
+	//  MAX31855 packet decoding
+	// ------------------------------------------------------------------ //
 
-		if (reservedBad || allZero || allOne) {
-			return MAX31855_NO_REPLY;
+	static State decodeFault(uint32_t p) {
+		if (p == 0x00000000u || p == 0xFFFFFFFFu) {
+			return State::NoReply;
 		}
-
-		if (packet & BIT(16)) {
-			if (packet & BIT(0)) {
-				return MAX31855_OPEN_CIRCUIT;
-			}
-			if (packet & BIT(1)) {
-				return MAX31855_SHORT_TO_GND;
-			}
-			if (packet & BIT(2)) {
-				return MAX31855_SHORT_TO_VCC;
-			}
+		// Fault bit D16 set → one of the fault sub-bits D[2:0] is set
+		if (p & BIT(16)) {
+			if (p & BIT(0)) return State::OpenCircuit;
+			if (p & BIT(1)) return State::ShortToGnd;
+			if (p & BIT(2)) return State::ShortToVcc;
 		}
-
-		return MAX31855_OK;
+		return State::Ok;
 	}
 
-	float decodeThermocouple(uint32_t packet) {
-		int16_t v = (packet >> 18) & 0x3FFF;
-		v = (int16_t)(v << 2);
-		v = (int16_t)(v >> 2);
+	// Bits [31:18]: 14-bit signed, 0.25 °C / LSB
+	static float decodeThermocouple(uint32_t p) {
+		auto v = static_cast<int16_t>((p >> 18) & 0x3FFF);
+		if (v & 0x2000) v |= static_cast<int16_t>(0xC000); // sign-extend
 		return v * 0.25f;
 	}
 
-	float decodeColdJunction(uint32_t packet) {
-		int16_t v = (packet >> 4) & 0x0FFF;
-		v = (int16_t)(v << 4);
-		v = (int16_t)(v >> 4);
+	// Bits [15:4]: 12-bit signed, 0.0625 °C / LSB
+	static float decodeColdJunction(uint32_t p) {
+		auto v = static_cast<int16_t>((p >> 4) & 0x0FFF);
+		if (v & 0x0800) v |= static_cast<int16_t>(0xF000); // sign-extend
 		return v * 0.0625f;
 	}
 
-	Max31855State readChannel(size_t channel, float* temp, float* coldJunctionTemp, bool verbose) {
-		if (!isBrainPinValid(m_cs[channel]) || driver == nullptr) {
-			return MAX31855_NOT_ENABLED;
+	// ------------------------------------------------------------------ //
+	//  Main read + cache logic
+	// ------------------------------------------------------------------ //
+
+	State readChannel(size_t ch, float* temp, float* cjTemp, bool verbose) {
+		if (!isBrainPinValid(m_cs[ch]) || !driver) {
+			return State::NotEnabled;
 		}
 
-		uint32_t packet = 0;
-		int ret = spiRx32(channel, &packet);
+		const uint32_t raw = readRaw32WithRetry(ch);
 
+		// Hard SPI error (driver/pin not configured)
+		if (raw == SPI_ERROR_SENTINEL) {
+			return returnCachedOrError(ch, temp, cjTemp, verbose);
+		}
+
+		// Decompose raw into bytes for the verbose log
 		if (verbose) {
-			efiPrintf("max31855 ch=%d raw=0x%08x spiRet=%d cs=%s",
-				(int)channel + 1,
-				packet,
-				ret,
-				hwPortname(m_cs[channel]));
-		}
+			efiPrintf("max31855 ch=%d bytes=%02x %02x %02x %02x raw=0x%08" PRIx32 " cs=%s",
+				(int)(ch + 1),
+				(unsigned int)((raw >> 24) & 0xFF),
+				(unsigned int)((raw >> 16) & 0xFF),
+				(unsigned int)((raw >>  8) & 0xFF),
+				(unsigned int)((raw >>  0) & 0xFF),
+				raw,
+				hwPortname(m_cs[ch]));
 
-		if (ret != 0) {
-			return MAX31855_NO_REPLY;
-		}
-
-		Max31855State code = decodeFault(packet);
-
-		if (verbose) {
 			efiPrintf("max31855 ch=%d fault=%d oc=%d scg=%d scv=%d",
-				(int)channel + 1,
-				(packet & BIT(16)) ? 1 : 0,
-				(packet & BIT(0)) ? 1 : 0,
-				(packet & BIT(1)) ? 1 : 0,
-				(packet & BIT(2)) ? 1 : 0);
+				(int)(ch + 1),
+				(raw & BIT(16)) ? 1 : 0,
+				(raw & BIT(0))  ? 1 : 0,
+				(raw & BIT(1))  ? 1 : 0,
+				(raw & BIT(2))  ? 1 : 0);
 		}
 
-		if (code != MAX31855_OK) {
+		const State code = decodeFault(raw);
+
+		if (code == State::NoReply) {
+			return returnCachedOrError(ch, temp, cjTemp, verbose);
+		}
+
+		if (code != State::Ok) {
+			// Real hardware fault (open/short) — don't cache, report immediately
+			m_staleCtr[ch] = 0;
 			return code;
 		}
 
-		float tc = decodeThermocouple(packet);
-		float cj = decodeColdJunction(packet);
+		// Valid reading — update cache and reset stale counter
+		const float tc = decodeThermocouple(raw);
+		const float cj = decodeColdJunction(raw);
 
-		if (temp) {
-			*temp = tc;
-		}
+		m_lastValidTemp[ch] = tc;
+		m_lastValidCj[ch]   = cj;
+		m_hasValidCache[ch] = true;
+		m_staleCtr[ch]      = 0;
 
-		if (coldJunctionTemp) {
-			*coldJunctionTemp = cj;
-		}
+		if (temp)   *temp   = tc;
+		if (cjTemp) *cjTemp = cj;
 
 		if (verbose) {
-			efiPrintf("max31855 ch=%d tc=%.2f cj=%.2f",
-				(int)channel + 1,
-				tc,
-				cj);
+			efiPrintf("max31855 ch=%d tc=%.2f cj=%.2f", (int)(ch + 1), tc, cj);
 		}
 
-		return MAX31855_OK;
+		return State::Ok;
 	}
+
+	/**
+	 * Return cached value if fresh enough, or NoReply if stale.
+	 * Increments m_staleCtr; once it reaches MAX31855_CACHE_STALE_COUNT
+	 * the cache is considered expired and a real error is reported.
+	 */
+	State returnCachedOrError(size_t ch, float* temp, float* cjTemp, bool verbose) {
+		if (!m_hasValidCache[ch]) {
+			return State::NoReply;
+		}
+
+		m_staleCtr[ch]++;
+
+		if (m_staleCtr[ch] > MAX31855_CACHE_STALE_COUNT) {
+			// Cache too old — invalidate and report real error
+			m_hasValidCache[ch] = false;
+			m_staleCtr[ch]      = 0;
+			return State::NoReply;
+		}
+
+		if (temp)   *temp   = m_lastValidTemp[ch];
+		if (cjTemp) *cjTemp = m_lastValidCj[ch];
+
+		if (verbose) {
+			efiPrintf("max31855 ch=%d using cached tc=%.2f cj=%.2f (stale %d/%d)",
+				(int)(ch + 1),
+				m_lastValidTemp[ch], m_lastValidCj[ch],
+				(int)m_staleCtr[ch], (int)MAX31855_CACHE_STALE_COUNT);
+		}
+
+		return State::Ok;
+	}
+
+	// ------------------------------------------------------------------ //
+	//  Sensor array
+	// ------------------------------------------------------------------ //
 
 	StoredValueSensor egtSensors[EGT_CHANNEL_COUNT] = {
 		{ SensorType::EGT1, MS2NT(MAX31855_REFRESH_TIME * 3) },
@@ -340,19 +407,15 @@ private:
 	};
 };
 
+// ------------------------------------------------------------------ //
+//  Module entry points
+// ------------------------------------------------------------------ //
+
 static Max31855Read instance;
 
-static void showEgtInfo() {
-	instance.showEgtInfo();
-}
-
-static void egtRead() {
-	instance.egtRead();
-}
-
 void initMax3185x(spi_device_e device, egt_cs_array_t max31855_cs) {
-	addConsoleAction("egtinfo", (Void)showEgtInfo);
-	addConsoleAction("egtread", (Void)egtRead);
+	addConsoleAction("egtinfo", [] { instance.showEgtInfo(); });
+	addConsoleAction("egtread", [] { instance.egtRead(); });
 	startMax3185x(device, max31855_cs);
 }
 
@@ -361,7 +424,7 @@ void stopMax3185x() {
 }
 
 void startMax3185x(spi_device_e device, egt_cs_array_t max31855_cs) {
-	instance.start(device, max31855_cs);
+	instance.init(device, max31855_cs);
 }
 
-#endif /* EFI_MAX_31855 */
+#endif // EFI_MAX_31855
