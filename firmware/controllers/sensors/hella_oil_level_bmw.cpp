@@ -29,10 +29,10 @@
  *
  *  №  Имя    Норма      Ошибка уровня   Что кодирует
  *  ─────────────────────────────────────────────────────────────────────
- *  1  LOW    ~40 ms     ~23 ms          Пауза перед DIAG (должна = DIAG)
- *  2  DIAG   ~40 ms     ~23 ms          Диагностический HIGH импульс
- *  3  TEMP    5..20 ms  не меняется     Ширина кодирует температуру масла
- *  4  LEVEL  90..400 ms зависит         Интервал RISE→RISE между TEMP = уровень масла
+ *  1  LOW    ~40 ms     ~20 ms          Пауза перед DIAG (должна = DIAG)
+ *  2  DIAG   ~40 ms     ~20 ms          Диагностический HIGH импульс
+ *  3  TEMP    5..35 ms  не меняется     Ширина кодирует температуру масла
+ *  4  LEVEL  50..400 ms зависит         Интервал RISE→RISE между TEMP = уровень масла
  *
  * ═══════════════════════════════════════════════════════════════════════
  *  ПРАВИЛА ВАЛИДАЦИИ (выполняются при каждом DIAG FALL):
@@ -42,13 +42,21 @@
  *
  *  2. DIAG_width попадает в одно из двух окон:
  *       37..43 ms → НОРМА     → diagError=false, данные валидны
- *       20..25 ms → ОШИБКА    → diagError=true, level=0, temp передаём
+ *       17..23 ms → ОШИБКА    → diagError=true, level=0, temp передаём
  *       иначе     → МУСОР     → все каналы = 0
  *
  *  При ошибке уровня (масло ниже минимума):
  *    - DIAG и LOW мигают: 20ms/20ms/20ms/20ms...
  *    - TEMP импульсы не изменяются → температуру всё равно передаём
  *    - Уровень = 0 мм (масло ниже минимума датчика)
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ *  КАЛИБРОВКА (все значения в миллисекундах):
+ *    hellaOilLevel.minPulseUsLevel / maxPulseUsLevel — диапазон LEVEL интервала (мс)
+ *    hellaOilLevel.minPulseUsTemp  / maxPulseUsTemp  — диапазон TEMP ширины (мс)
+ *    hellaOilLevel.minLevelMm / maxLevelMm           — диапазон уровня (мм)
+ *    hellaOilLevel.minTempC   / maxTempC             — диапазон температуры (°C)
+ *  Примечание: поля называются *Us* по историческим причинам, но хранят мс.
  */
 
 #include "pch.h"
@@ -61,17 +69,17 @@
 
 // Диапазон TEMP импульсов (кодируют температуру масла)
 static constexpr float TEMP_MIN_MS       =  5.0f;  // мин. допустимая ширина TEMP
-static constexpr float TEMP_MAX_MS       = 20.0f;  // макс. допустимая ширина TEMP
+static constexpr float TEMP_MAX_MS       = 35.0f;  // макс. допустимая ширина TEMP
 
 // Ширины DIAG импульса (и LOW паузы перед ним)
 static constexpr float DIAG_NORMAL_MS    = 40.0f;  // нормальная работа: оба ~40 мс
-static constexpr float DIAG_ERROR_MS     = 24.0f;  // ошибка уровня масла: оба ~20 мс
+static constexpr float DIAG_ERROR_MS     = 20.0f;  // ошибка уровня масла: оба ~20 мс
 static constexpr float DIAG_MATCH_TOL_MS =  3.0f;  // допуск: |LOW - DIAG| <= 3 мс
-static constexpr float DIAG_MIN_ABS_MS   = 21.0f;  // ниже — перекрытие с TEMP → мусор
+static constexpr float DIAG_MIN_ABS_MS   = 17.0f;  // ниже — перекрытие с TEMP → мусор
 
 // Допустимый диапазон интервала между TEMP импульсами (= уровень масла)
-static constexpr float LEVEL_MIN_MS      = 90.0f;  // мин. интервал RISE→RISE
-static constexpr float LEVEL_MAX_MS      = 500.0f; // макс. интервал RISE→RISE
+static constexpr float LEVEL_MIN_MS      = 20.0f;  // мин. интервал RISE→RISE
+static constexpr float LEVEL_MAX_MS      = 400.0f; // макс. интервал RISE→RISE
 
 // ── Состояние парсера (живёт на всё время работы) ───────────────────────────
 static int   cb_num          = 0;     // счётчик EXTI прерываний (для отладки)
@@ -123,49 +131,61 @@ static void hellaOilCallback(efitick_t nowNt, bool isHigh) {
         // ════════════════════════════════════════════════════════════════════
         //  TEMP импульс: 5..35 мс
         //  Ширина линейно кодирует температуру масла.
-        //  Calibration: hellaOilLevel.{min/max}PulseUsTemp (в us в конфиге → /1000 → мс)
+        //  Calibration: hellaOilLevel.{min/max}PulseUsTemp (хранятся в мс)
         // ════════════════════════════════════════════════════════════════════
         if (highWidth_ms >= TEMP_MIN_MS && highWidth_ms <= TEMP_MAX_MS) {
 
-            // Конфиг хранит пороги в микросекундах → переводим в мс
-            float minTempMs = engineConfiguration->hellaOilLevel.minPulseUsTemp / 1000.0f;
-            float maxTempMs = engineConfiguration->hellaOilLevel.maxPulseUsTemp / 1000.0f;
+            // Конфиг хранит значения в мс (поля называются *Us по историческим причинам)
+            float minTempMs = (float)engineConfiguration->hellaOilLevel.minPulseUsTemp;
+            float maxTempMs = (float)engineConfiguration->hellaOilLevel.maxPulseUsTemp;
 
             float temp = interpolateClamped(
                 minTempMs, engineConfiguration->hellaOilLevel.minTempC,
                 maxTempMs, engineConfiguration->hellaOilLevel.maxTempC,
                 highWidth_ms
             );
+            // Температуру передаём всегда — TEMP импульсы не зависят от ошибки уровня
             tempSensor.setValidValue(temp, nowNt);
-            rawTempSensor.setValidValue(highWidth_ms, nowNt);  // сырое значение для диагностики
+            rawTempSensor.setValidValue(highWidth_ms, nowNt);
             efiPrintf("HELLA TEMP: %.1fms → %.1fC", highWidth_ms, temp);
 
             // ── Уровень масла ────────────────────────────────────────────────
             // Уровень = интервал от RISE предыдущего TEMP до RISE текущего TEMP.
-            // Первый TEMP после старта/сброса пропускаем (нет предыдущей точки отсчёта).
+            // Первый TEMP после старта пропускаем (нет предыдущей точки отсчёта).
+            // При diagError уровень всё равно вычисляем, но пишем 0 — чтобы не
+            // сбрасывать lastTempRise_ms и не получать выброс 500 мс после ERROR.
             if (lastTempRise_ms > 0) {
                 float levelTime_ms = lastRiseTime_ms - lastTempRise_ms;
 
                 if (levelTime_ms >= LEVEL_MIN_MS && levelTime_ms <= LEVEL_MAX_MS) {
-                    // Конфиг хранит пороги в микросекундах → переводим в мс
-                    float minLevelMs = engineConfiguration->hellaOilLevel.minPulseUsLevel / 1000.0f;
-                    float maxLevelMs = engineConfiguration->hellaOilLevel.maxPulseUsLevel / 1000.0f;
+                    if (diagError) {
+                        // Датчик сигнализирует об ошибке — уровень принудительно 0
+                        levelSensor.setValidValue(0, nowNt);
+                        rawLevelSensor.setValidValue(0, nowNt);
+                        efiPrintf("HELLA LEVEL: diagError → 0mm");
+                    } else {
+                        // Конфиг хранит значения в мс (поля называются *Us по историческим причинам)
+                        float minLevelMs = (float)engineConfiguration->hellaOilLevel.minPulseUsLevel;
+                        float maxLevelMs = (float)engineConfiguration->hellaOilLevel.maxPulseUsLevel;
 
-                    float level = interpolateClamped(
-                        minLevelMs, engineConfiguration->hellaOilLevel.minLevelMm,
-                        maxLevelMs, engineConfiguration->hellaOilLevel.maxLevelMm,
-                        levelTime_ms
-                    );
-                    levelSensor.setValidValue(level, nowNt);
-                    rawLevelSensor.setValidValue(levelTime_ms, nowNt);  // сырое значение для диагностики
-                    efiPrintf("HELLA LEVEL: %.1fms → %.1fmm", levelTime_ms, level);
+                        float level = interpolateClamped(
+                            minLevelMs, engineConfiguration->hellaOilLevel.minLevelMm,
+                            maxLevelMs, engineConfiguration->hellaOilLevel.maxLevelMm,
+                            levelTime_ms
+                        );
+                        levelSensor.setValidValue(level, nowNt);
+                        rawLevelSensor.setValidValue(levelTime_ms, nowNt);
+                        efiPrintf("HELLA LEVEL: %.1fms → %.1fmm", levelTime_ms, level);
+                    }
                 } else {
-                    // Интервал вне допустимого диапазона — шум или начало нового фрейма
+                    // Интервал вне допустимого диапазона — шум или первый TEMP после сброса
                     efiPrintf("HELLA LEVEL: interval %.1fms out of range, skip", levelTime_ms);
                 }
             }
 
-            // Запоминаем время RISE этого TEMP для вычисления следующего интервала
+            // Запоминаем время RISE этого TEMP для вычисления следующего интервала.
+            // Обновляем всегда — в том числе при diagError, чтобы следующий интервал
+            // считался от этого TEMP, а не прыгал через целый фрейм.
             lastTempRise_ms = lastRiseTime_ms;
 
         // ════════════════════════════════════════════════════════════════════
@@ -206,13 +226,12 @@ static void hellaOilCallback(efitick_t nowNt, bool isHigh) {
             } else if (diagCenter >= (DIAG_ERROR_MS - DIAG_MATCH_TOL_MS) &&
                        diagCenter <= (DIAG_ERROR_MS + DIAG_MATCH_TOL_MS)) {
                 // Ошибка уровня масла: LOW ~20 мс, DIAG ~20 мс, мигание
-                // Уровень = 0 (масло ниже минимума датчика)
-                // Температуру продолжаем передавать — TEMP импульсы не меняются
+                // Уровень будет принудительно 0 при следующем TEMP.
+                // Температуру продолжаем передавать — TEMP импульсы не меняются.
+                // lastTempRise_ms НЕ сбрасываем — иначе следующий LEVEL интервал
+                // будет считаться через два фрейма (~500 мс) и уйдёт за LEVEL_MAX_MS.
                 diagError = true;
-                efiPrintf("HELLA DIAG: OIL LEVEL ERROR (%.1fms) → level=0", diagCenter);
-                levelSensor.setValidValue(0, nowNt);
-                rawLevelSensor.setValidValue(0, nowNt);
-                lastTempRise_ms = 0;  // сбрасываем: при ошибке LEVEL данные не имеют смысла
+                efiPrintf("HELLA DIAG: OIL LEVEL ERROR (%.1fms)", diagCenter);
 
             } else {
                 // Длина DIAG не попадает ни в одно из ожидаемых окон → мусор
